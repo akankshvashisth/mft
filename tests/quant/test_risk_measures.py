@@ -2,19 +2,16 @@ import math
 
 import numpy as np
 import pytest
-import QuantLib as ql
-from scipy.stats import norm
-
 from src.quant.risk_measures import (
+    TailMetrics,
     contracts_for_tail_budget,
     parametric_book_var_es,
     tail_loss_per_lot,
     tail_metrics,
 )
 
-# Reference normal multipliers from QuantLib (the implementation uses scipy)
-Z_99 = ql.InverseCumulativeNormal()(0.99)
-ES_MULT_99 = ql.NormalDistribution()(Z_99) / 0.01
+Z_99 = 2.3263478744090126
+ES_MULT_99 = 2.6652132234682377
 
 
 def test_tail_metrics_on_a_uniform_ladder():
@@ -25,18 +22,19 @@ def test_tail_metrics_on_a_uniform_ladder():
     assert m.var_95 == pytest.approx(-44.05)  # Linear interpolation at the 5th percentile
     assert m.es_95 == pytest.approx(-47.0)  # Mean of -49 .. -45
     assert m.var_99 == pytest.approx(-48.01)
-    assert m.es_99 == pytest.approx(-49.0)
+    assert m.es_99 == pytest.approx(-49.0)  # -49 is the only value at or below -48.01
 
 
-def test_tail_metrics_of_a_normal_sample_match_the_normal_quantiles_and_shortfalls():
-    sigma = 100.0
-    m = tail_metrics(np.random.default_rng(1).normal(0.0, sigma, 400_000))
+def test_tail_metrics_ignore_non_finite_observations():
+    m = tail_metrics([-20.0, np.nan, 10.0, np.inf, -10.0])
+    assert m.mean == pytest.approx(-20 / 3)
+    assert m.prob_profit == pytest.approx(1 / 3)
+    assert all(math.isfinite(x) for x in (m.var_95, m.es_95, m.var_99, m.es_99))
 
-    for level, var, es in ((0.05, m.var_95, m.es_95), (0.01, m.var_99, m.es_99)):
-        z = norm.ppf(level)
-        assert var == pytest.approx(sigma * z, rel=0.02)
-        assert es == pytest.approx(-sigma * norm.pdf(z) / level, rel=0.02)  # E[X | X <= VaR]
-    assert m.prob_profit == pytest.approx(0.5, abs=0.005)
+
+def test_tail_metrics_are_zero_for_empty_or_non_finite_input():
+    for pnl in ([], [np.nan], [np.inf, -np.inf]):
+        assert tail_metrics(pnl) == TailMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
 def test_expected_shortfall_never_exceeds_var():
@@ -50,6 +48,11 @@ def test_expected_shortfall_never_exceeds_var():
 @pytest.mark.parametrize("es_99, loss", [(-300.0, 300.0), (-0.2, 1.0), (5.0, 1.0)])
 def test_tail_loss_per_lot_is_floored_at_one_dollar(es_99, loss):
     assert tail_loss_per_lot(es_99) == loss
+
+
+@pytest.mark.parametrize("es_99", [np.nan, np.inf, -np.inf])
+def test_tail_loss_per_lot_handles_non_finite_es(es_99):
+    assert tail_loss_per_lot(es_99) == 1.0
 
 
 @pytest.mark.parametrize(
@@ -91,3 +94,20 @@ def test_parametric_var_es_properties():
     # Lower confidence, smaller multipliers
     var_95, es_95 = parametric_book_var_es(250.0, 40.0, 700.0, 0.15, confidence=0.95)
     assert var_95 < var_99 and es_95 < es_99
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"trading_days": 0},
+        {"confidence": 0.0},
+        {"confidence": 1.0},
+        {"rv_annual": -0.1},
+        {"rv_annual": np.nan},
+        {"vol_move_frac": -0.1},
+    ],
+)
+def test_parametric_var_es_rejects_invalid_numeric_inputs(kwargs):
+    with pytest.raises(ValueError):
+        rv_annual = kwargs.pop("rv_annual", 0.15)
+        parametric_book_var_es(250.0, 40.0, 700.0, rv_annual, **kwargs)

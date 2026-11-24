@@ -48,6 +48,14 @@ def test_short_history_falls_back_to_close_to_close_vol():
     assert yang_zhang_rv(_closes_frame([100.0, 101.0]), 20) == 0.0  # One return: no dispersion estimate
 
 
+def test_realized_vol_guards_invalid_ohlc_and_windows():
+    invalid = pd.DataFrame({"open": [100.0, 0.0], "high": [101.0, 100.0], "low": [99.0, 99.0], "close": [100.0, np.nan]})
+    assert yang_zhang_rv(invalid, 20) == 0.0
+    assert yang_zhang_rv(pd.DataFrame(), 20) == 0.0
+    assert yang_zhang_rv(_closes_frame([100.0] * 30), 0) == 0.0
+    assert bipower_jump_ratio(invalid, 20) == 0.0
+
+
 # --- Bipower jump share ---------------------------------------------------------------------------
 
 

@@ -23,6 +23,10 @@ class TailMetrics:
 def tail_metrics(pnl) -> TailMetrics:
     """Mean, P(P&L > 0), 5%/1% VaR (percentiles) and ES (mean P&L at or below each VaR)."""
     pnl = np.asarray(pnl, dtype=np.float64)
+    pnl = pnl[np.isfinite(pnl)]
+    if pnl.size == 0:
+        return TailMetrics(mean=0.0, prob_profit=0.0, var_95=0.0, es_95=0.0, var_99=0.0, es_99=0.0)
+
     var_95 = float(np.percentile(pnl, 5.0))
     es_95 = float(np.mean(pnl[pnl <= var_95]))
     var_99 = float(np.percentile(pnl, 1.0))
@@ -39,6 +43,8 @@ def tail_metrics(pnl) -> TailMetrics:
 
 def tail_loss_per_lot(es_99: float) -> float:
     """Positive tail loss used for sizing; floored at $1 so near-riskless P&L can't divide by zero."""
+    if not math.isfinite(es_99):
+        return 1.0
     return abs(min(es_99, -1.0))
 
 
@@ -64,6 +70,19 @@ def parametric_book_var_es(
     One-day spot sigma is spot * rv / sqrt(trading_days); the vol move is vol_move_frac of RV in vol points.
     The VaR multiplier is the normal quantile z and the ES multiplier E[Z | Z > z] = pdf(z) / (1 - confidence).
     """
+    if trading_days <= 0:
+        raise ValueError("trading_days must be positive")
+    if not 0.0 < confidence < 1.0:
+        raise ValueError("confidence must be between zero and one")
+    if not all(math.isfinite(x) for x in (beta_delta_shares, net_vega_1v, spot)):
+        raise ValueError("exposure and spot inputs must be finite")
+    if spot < 0.0:
+        raise ValueError("spot must be non-negative")
+    if not math.isfinite(rv_annual) or rv_annual < 0.0:
+        raise ValueError("rv_annual must be finite and non-negative")
+    if not math.isfinite(vol_move_frac) or vol_move_frac < 0.0:
+        raise ValueError("vol_move_frac must be finite and non-negative")
+
     daily_sigma_usd = spot * (rv_annual / math.sqrt(trading_days))
     lin_std_usd = abs(beta_delta_shares) * daily_sigma_usd + abs(net_vega_1v) * (rv_annual * 100.0 * vol_move_frac)
     z_var = float(norm.ppf(confidence))

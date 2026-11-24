@@ -15,6 +15,15 @@ def yang_zhang_rv(df: pd.DataFrame, window: int, ann: int = TRADING_DAYS_PER_YEA
 
     With fewer than window + 1 bars it falls back to close-to-close volatility of what is available.
     """
+    if window <= 0 or ann <= 0 or df.empty:
+        return 0.0
+    required = ("open", "high", "low", "close")
+    if any(column not in df for column in required):
+        return 0.0
+    prices = df[list(required)].to_numpy(dtype=np.float64)
+    if prices.shape[0] == 0 or not np.isfinite(prices).all() or (prices <= 0.0).any():
+        return 0.0
+
     if len(df) < window + 1:
         rets = np.log(df["close"] / df["close"].shift(1)).dropna()
         return float(rets.std(ddof=1) * np.sqrt(ann)) if len(rets) > 1 else 0.0
@@ -38,6 +47,11 @@ def yang_zhang_rv(df: pd.DataFrame, window: int, ann: int = TRADING_DAYS_PER_YEA
 
 def bipower_jump_ratio(df: pd.DataFrame, window: int = 20) -> float:
     """Fraction of recent variance attributable to discrete jumps: (RV - BV) / RV, clipped to [0, 1]."""
+    if window <= 0 or df.empty or "close" not in df:
+        return 0.0
+    closes = df["close"].to_numpy(dtype=np.float64)
+    if not np.isfinite(closes).all() or (closes <= 0.0).any():
+        return 0.0
     rets = np.log(df["close"] / df["close"].shift(1)).dropna().to_numpy(dtype=np.float64)
     if len(rets) < window + 1:
         return 0.0

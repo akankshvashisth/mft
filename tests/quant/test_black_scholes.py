@@ -87,6 +87,9 @@ def test_put_call_parity_for_price_delta_and_shared_greeks():
         (700.0, 690.0, 0.0, 0.2, False, 0.0, 0.0),
         (680.0, 690.0, 0.0, 0.2, False, 10.0, -1.0),
         (680.0, 690.0, 0.5, 0.0, True, 0.0, 0.0),
+        (0.0, 690.0, 0.5, 0.2, True, 0.0, 0.0),
+        (0.0, 690.0, 0.5, 0.2, False, 690.0, -1.0),
+        (700.0, 0.0, 0.5, 0.2, True, 700.0, 1.0),
     ],
 )
 def test_expired_or_zero_vol_options_are_worth_intrinsic(spot, strike, ttm, sigma, is_call, price, delta):
