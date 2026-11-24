@@ -5,12 +5,13 @@ import pytest
 pytest.importorskip("nautilus_trader")
 pytestmark = pytest.mark.nautilus
 
-from nautilus_trader.model import OrderSide, TimeInForce  # noqa: E402
+from nautilus_trader.model import OptionSpread, OrderSide, TimeInForce  # noqa: E402
 
 from src.adapters.order_gateway import NautilusMarketView, NautilusOrderGateway  # noqa: E402
 from src.common.market import QuoteObs  # noqa: E402
 from src.strategies.vrp_engine import OrderView  # noqa: E402
 from tests.fakes import FakeStrategyPorts  # noqa: E402
+from tests.nautilus_objects import option_contract  # noqa: E402
 
 P690, P685 = "SPY 261218P00690000.SMART", "SPY 261218P00685000.SMART"
 LEGS = [{"instrument_id": P690, "ratio": 1}, {"instrument_id": P685, "ratio": -1}]
@@ -18,7 +19,12 @@ LEGS = [{"instrument_id": P690, "ratio": 1}, {"instrument_id": P685, "ratio": -1
 
 @pytest.fixture
 def ports():
-    return FakeStrategyPorts()
+    return FakeStrategyPorts(
+        instruments={
+            P690: option_contract(P690, 690),
+            P685: option_contract(P685, 685),
+        }
+    )
 
 
 def test_prepare_builds_one_spread_instrument_and_day_limit_orders(ports):
@@ -28,6 +34,11 @@ def test_prepare_builds_one_spread_instrument_and_day_limit_orders(ports):
     exit_ = gateway.prepare(LEGS, "DEBIT_CLOSE", 2, 0.63)
 
     (spread,) = ports.added_instruments
+    assert isinstance(spread, OptionSpread)
+    assert spread.info["legs"] == [
+        {"instrument_id": P690, "ratio": 1},
+        {"instrument_id": P685, "ratio": -1},
+    ]
     assert (entry.order_key, entry.spread_id, exit_.order_key) == ("O-1", str(spread.id), "O-2")
     first, second = ports.limit_orders
     assert (first.side, second.side) == (OrderSide.SELL, OrderSide.BUY)
@@ -68,6 +79,7 @@ def test_modify_needs_the_spread_instrument(ports):
 def test_market_view(ports):
     ports.quotes[P690] = SimpleNamespace(instrument_id=P690, bid_price=2.0, ask_price=2.2, bid_size=5, ask_size=None, ts_event=10)
     ports.instruments_by_id[P690] = SimpleNamespace(id=P690)  # Not an OptionContract
+    ports.instruments_by_id.pop(P685)
     ports.open_positions = [
         SimpleNamespace(instrument_id="S1", signed_qty=-2),
         SimpleNamespace(instrument_id="S1", signed_qty=-1),

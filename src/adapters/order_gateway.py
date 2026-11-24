@@ -3,7 +3,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from nautilus_trader.model import InstrumentId, OptionContract, OptionSpread, OrderSide, TimeInForce
+from nautilus_trader.model import (
+    InstrumentId,
+    OptionContract,
+    OptionSpread,
+    OrderSide,
+    Symbol,
+    TimeInForce,
+)
 
 from src.adapters.extract import option_spec_from_instrument
 from src.adapters.nautilus import quote_obs
@@ -24,7 +31,54 @@ class NautilusOrderGateway:
         signature = tuple((str(leg["instrument_id"]), int(leg["ratio"])) for leg in legs)
         spread = self._spreads.get(signature)
         if spread is None:
-            spread = OptionSpread.from_legs([(InstrumentId.from_str(iid), ratio) for iid, ratio in signature])
+            parsed_legs = [(InstrumentId.from_str(iid), ratio) for iid, ratio in signature]
+            contracts = [self.ports.instrument(instrument_id) for instrument_id, _ in parsed_legs]
+            if not all(isinstance(contract, OptionContract) for contract in contracts):
+                raise ValueError("Every spread leg must refer to a cached OptionContract")
+
+            first = contracts[0]
+            if any(
+                (contract.underlying, contract.expiration_ns, contract.currency, contract.multiplier)
+                != (first.underlying, first.expiration_ns, first.currency, first.multiplier)
+                for contract in contracts[1:]
+            ):
+                raise ValueError("Spread legs must share an underlying, expiration, currency, and multiplier")
+
+            venues = {str(instrument_id.venue) for instrument_id, _ in parsed_legs}
+            if len(venues) != 1:
+                raise ValueError("Spread legs must share a venue")
+
+            raw_symbol = "SPREAD-" + "-".join(
+                f"{instrument_id.symbol}".replace(" ", "-")
+                + ("-P" if ratio >= 0 else "-M")
+                + str(abs(ratio))
+                for instrument_id, ratio in parsed_legs
+            )
+            symbol = Symbol.from_str(raw_symbol)
+            venue = next(iter(venues))
+            now_ns = self.ports.now_ns()
+            spread = OptionSpread(
+                instrument_id=InstrumentId.from_str(f"{symbol}.{venue}"),
+                raw_symbol=symbol,
+                asset_class=first.asset_class,
+                underlying=first.underlying,
+                strategy_type="CUSTOM",
+                activation_ns=first.activation_ns,
+                expiration_ns=first.expiration_ns,
+                currency=first.currency,
+                price_precision=first.price_precision,
+                price_increment=first.price_increment,
+                multiplier=first.multiplier,
+                lot_size=first.lot_size,
+                ts_event=now_ns,
+                ts_init=now_ns,
+                info={
+                    "legs": [
+                        {"instrument_id": str(instrument_id), "ratio": ratio}
+                        for instrument_id, ratio in parsed_legs
+                    ]
+                },
+            )
             self.ports.add_instrument(spread)
             self._spreads[signature] = spread
         return spread

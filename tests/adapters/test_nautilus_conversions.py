@@ -51,7 +51,7 @@ def test_trade_tick_becomes_a_trade_observation():
         instrument_id=InstrumentId.from_str("MESZ6.CME"),
         price=Price.from_str("7020.25"),
         size=Quantity.from_int(1),
-        aggressor_side=AggressorSide.BUYER,
+        aggressor_side=AggressorSide.BUY,
         trade_id=TradeId("T-1"),
         ts_event=NOW_NS,
         ts_init=NOW_NS,

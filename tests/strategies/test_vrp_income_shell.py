@@ -12,7 +12,7 @@ import src.strategies.vrp_income as shell_module  # noqa: E402
 from src.common import keys  # noqa: E402
 from tests.factories import NOW_NS, risk_assessment, rv_payload, surface_leg, surface_payload  # noqa: E402
 from tests.fakes import FakeGate, FakePricer, FakeStrategyPorts, stub_calendar  # noqa: E402
-from tests.nautilus_objects import iid, quote_tick, timer_event  # noqa: E402
+from tests.nautilus_objects import iid, option_contract, quote_tick, timer_event  # noqa: E402
 
 SPY = "SPY.ARCA"
 P690, P685, P680 = (f"SPY 261218P{k * 1000:08d}.SMART" for k in (690, 685, 680))
@@ -41,7 +41,12 @@ def make_strategy(monkeypatch, store):
             )
         )
         strategy.ports = FakeStrategyPorts(
-            now_ns=NOW_NS, instruments={i: SimpleNamespace(id=i) for i in (P690, P685)}
+            now_ns=NOW_NS,
+            instruments={
+                P690: option_contract(P690, 690),
+                P685: option_contract(P685, 685),
+                P680: option_contract(P680, 680),
+            },
         )
         strategy.vrp_engine.gate = FakeGate()
         strategy.vrp_engine.pricer = FakePricer(lambda combo: risk_assessment(combo_name=combo.name))
@@ -80,6 +85,7 @@ def test_live_entry_goes_through_the_nautilus_gateway(make_strategy):
 
     strategy.on_timer(timer_event(NOW_NS))
 
+    assert strategy.ports.submitted, strategy.ports.errors
     (order,) = strategy.ports.submitted
     assert order is strategy.ports.limit_orders[0]
     assert len(strategy.ports.added_instruments) == 1  # The OptionSpread instrument

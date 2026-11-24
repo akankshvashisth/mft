@@ -3,11 +3,44 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from nautilus_trader.model import Bar, BarType, InstrumentId, Price, Quantity, QuoteTick
+from nautilus_trader.model import (
+    AssetClass,
+    Bar,
+    BarType,
+    Currency,
+    InstrumentId,
+    OptionContract,
+    OptionKind,
+    Price,
+    Quantity,
+    QuoteTick,
+    Symbol,
+)
 
 
 def iid(text: str) -> InstrumentId:
     return InstrumentId.from_str(text)
+
+
+def option_contract(instrument_id: str, strike: float, underlying: str = "SPY") -> OptionContract:
+    instrument = iid(instrument_id)
+    return OptionContract(
+        instrument_id=instrument,
+        raw_symbol=Symbol.from_str(str(instrument.symbol)),
+        asset_class=AssetClass.EQUITY,
+        underlying=underlying,
+        option_kind=OptionKind.PUT,
+        strike_price=Price.from_str(str(strike)),
+        currency=Currency.from_str("USD"),
+        activation_ns=0,
+        expiration_ns=0,
+        price_precision=2,
+        price_increment=Price.from_str("0.01"),
+        multiplier=Quantity.from_int(100),
+        lot_size=Quantity.from_int(1),
+        ts_event=0,
+        ts_init=0,
+    )
 
 
 def quote_tick(instrument: str, bid: float, ask: float, ts_ns: int, bid_size: int = 10, ask_size: int = 10) -> QuoteTick:

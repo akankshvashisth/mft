@@ -1,0 +1,16 @@
+QuantLib
+databento
+fast-vollib
+nautilus_trader==2.0.0rc9
+numpy
+pandas
+plotly
+pyarrow
+python-dotenv
+PyYAML
+redis
+requests
+scikit-learn
+scipy
+streamlit
+torch
