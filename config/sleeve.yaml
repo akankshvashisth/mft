@@ -1,0 +1,20 @@
+sleeve:
+  allocated_capital_usd: 100000.0   # Decoupled from IBKR NLV[cite: 7]
+  target_ann_vol: 0.09
+  max_initial_margin_usd: 45000.0
+  drawdown_brake_pct: -0.05
+  daily_loss_kill_usd: -2500.0
+
+infra:
+  valkey_host: "127.0.0.1"
+  valkey_port: 6379
+
+execution:
+  max_clip_contracts: 5
+  max_pct_open_interest: 0.05
+  vix_backwardation_gate: 1.00
+
+universe:
+  active_underlyings: ["XBI", "KRE", "GDX", "SMH"]
+  macro_indices: ["VIX", "VIX3M"]
+  hedge_futures: ["MES"]

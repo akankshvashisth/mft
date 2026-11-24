@@ -1,0 +1,38 @@
+# Macro release dates (FOMC, CPI, NFP) - flags 1-day front-month vol kinks
+macro_events:
+  - date: "2026-12-09"
+    name: "FOMC Rate Decision"
+    severity: "HIGH"
+  - date: "2026-12-10"
+    name: "US CPI Release"
+    severity: "HIGH"
+  - date: "2026-12-04"
+    name: "US Non-Farm Payrolls"
+    severity: "MEDIUM"
+
+# Discrete ex-dividend & earnings schedule (populated automatically via ThetaData / IBKR corporate actions)
+corporate_events:
+  SPY.ARCA:
+    sector: "INDEX_ETF"
+    htb_fee_annual: 0.0025
+    ex_dividends:
+      - date: "2026-12-18"
+        amount: 1.78
+    earnings: []
+  QQQ.NASDAQ:
+    sector: "INDEX_ETF"
+    htb_fee_annual: 0.0025
+    ex_dividends:
+      - date: "2026-12-21"
+        amount: 0.68
+    earnings: []
+  XBI.ARCA:
+    sector: "BIOTECH"
+    htb_fee_annual: 0.0050
+    ex_dividends: []
+    earnings: []
+  SMH.NASDAQ:
+    sector: "SEMICONDUCTORS"
+    htb_fee_annual: 0.0040
+    ex_dividends: []
+    earnings: []

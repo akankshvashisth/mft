@@ -1,0 +1,12 @@
+.env
+.venv/
+build/
+data/
+catalog/
+tools/telemetry-spool/
+__pycache__/
+*.dbn.zst
+*.parquet
+*.jar
+tools/creds.txt
+logs/

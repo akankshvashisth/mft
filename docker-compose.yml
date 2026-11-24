@@ -1,0 +1,22 @@
+services:
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: mft_valkey
+    ports:
+      - "127.0.0.1:6379:6379"
+    command: valkey-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: mft_ib_gateway
+    restart: unless-stopped
+    environment:
+      TWS_USERID: ${TWS_USERNAME}
+      TWS_PASSWORD: ${TWS_PASSWORD}
+      TRADING_MODE: paper
+      TWS_ACCEPT_INCOMING: "accept"
+      READ_ONLY_API: "no"
+      EXISTING_SESSION_DETECTED_ACTION: primary
+    ports:
+      - "127.0.0.1:4002:4004"
