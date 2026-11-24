@@ -5,245 +5,153 @@ import json
 import os
 import signal
 import time
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
-from pathlib import Path
+from collections.abc import Callable
+from dataclasses import asdict
 from typing import Any
 
-import redis
+from src.common import keys
+from src.common.constants import DEFAULT_VALKEY_URL
+from src.common.jsonl import JsonlSink, RecordSink
+from src.common.store import JsonStore, make_store
+from src.common.timeutil import iso_utc
+from src.risk.daemon_rules import (
+    TRANSITION,
+    HEARTBEAT,
+    RiskDaemonConfig,
+    RiskEvaluation,
+    RiskInputs,
+    TransitionTracker,
+    evaluate_risk,
+    state_ttl_ms,
+)
 
-
-@dataclass
-class RiskDaemonConfig:
-    valkey_url: str = "redis://127.0.0.1:6379/0"
-    poll_interval_sec: float = 2.0
-    max_regime_age_sec: float = 120.0
-    max_surface_age_sec: float = 120.0
-    max_rv_age_sec: float = 86400.0
-    max_drawdown_pct: float = -5.0
-    vix_ratio_halt_threshold: float = 1.0
-    surface_keys: tuple[str, ...] = ("mft:surface:SPY.ARCA",)
-    rv_keys: tuple[str, ...] = ("mft:rv:SPY.ARCA",)
-    history_max_len: int = 2000
-    transitions_max_len: int = 500
-    jsonl_path: str = "logs/risk_history.jsonl"
-    heartbeat_log_interval_sec: float = 60.0
-
-
-@dataclass
-class RiskEvaluation:
-    halted: bool
-    reasons: list[str]
-    evaluated_at_ns: int
-    evaluated_at_utc: str
-    sleeve_drawdown_pct: float | None
-    vix_ratio: float | None
-    regime_age_sec: float | None
-    surface_ages_sec: dict[str, float | None]
-
-
-def _safe_json_load(raw: str | bytes | None) -> dict[str, Any] | None:
-    if raw is None:
-        return None
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8")
-    try:
-        data = json.loads(raw)
-        return data if isinstance(data, dict) else None
-    except json.JSONDecodeError:
-        return None
-
-
-def _extract_age_sec(payload: dict[str, Any], now_ns: int) -> float | None:
-    for key in ("ts_ns", "ts_event", "ts_init", "updated_at_ns"):
-        val = payload.get(key)
-        if isinstance(val, (int, float)) and val > 1e15:
-            delta_sec = (now_ns - float(val)) / 1e9
-            if delta_sec < 0.0 and delta_sec >= -900.0:
-                return 0.0
-            return delta_sec
-    return None
-
-
-def _iso_utc(now_ns: int) -> str:
-    return datetime.fromtimestamp(now_ns / 1e9, tz=timezone.utc).isoformat()
+__all__ = ["OutOfProcessRiskDaemon", "RiskDaemonConfig", "RiskEvaluation", "main", "print_summary"]
 
 
 class OutOfProcessRiskDaemon:
-    """Independent OS process monitoring Valkey state, enforcing fail-closed halts, and recording history."""
+    """Independent OS process monitoring Valkey state, enforcing fail-closed halts, and recording history.
 
-    def __init__(self, config: RiskDaemonConfig | None = None) -> None:
+    Reads go through read_inputs(), the decision is the pure evaluate_risk(), and results are written with
+    TTLs in one batch. The store, the JSONL sink, the wall clock and the sleep function are injectable.
+    """
+
+    def __init__(
+        self,
+        config: RiskDaemonConfig | None = None,
+        *,
+        store: JsonStore | None = None,
+        sink: RecordSink | None = None,
+        clock_ns: Callable[[], int] = time.time_ns,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         self.config = config or RiskDaemonConfig()
-        self.rdb = redis.from_url(self.config.valkey_url)
+        self.store = store if store is not None else make_store(self.config.valkey_url)
+        # The log directory is created on first write, not here
+        self.sink = sink if sink is not None else JsonlSink(self.config.jsonl_path)
+        self.clock_ns = clock_ns
+        self.sleep = sleep
+        self.transitions = TransitionTracker(self.config.heartbeat_log_interval_sec)
         self._running = True
-        self._prev_halted: bool | None = None
-        self._prev_reasons: list[str] | None = None
-        self._last_disk_write_ns: int = 0
-
-        Path(self.config.jsonl_path).parent.mkdir(parents=True, exist_ok=True)
+        self._ttl_ms = state_ttl_ms(self.config)
 
     def stop(self, *_: Any) -> None:
         self._running = False
 
-    def _append_jsonl(self, record: dict[str, Any]) -> None:
-        with open(self.config.jsonl_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
-
-    def evaluate_once(self, now_ns: int | None = None) -> RiskEvaluation:
-        now_ns = now_ns if now_ns is not None else time.time_ns()
-        reasons: list[str] = []
-
-        # 1. Explicit manual kill-switch check (never auto-cleared by daemon)
-        manual_halt = self.rdb.get("mft:risk:manual_halt")
-        if manual_halt and manual_halt.decode("utf-8").strip().lower() in {"1", "true", "yes", "on"}:
-            reasons.append("manual_kill_switch_active")
-
-        # 2. Regime & VIX/VIX3M backwardation check
-        regime = _safe_json_load(self.rdb.get("mft:regime:latest"))
-        vix_ratio: float | None = None
-        regime_age_sec: float | None = None
-        if regime is None:
-            reasons.append("missing_regime_signal")
-        else:
-            age = _extract_age_sec(regime, now_ns)
-            if age is not None:
-                regime_age_sec = round(age, 2)
-                if age > self.config.max_regime_age_sec:
-                    reasons.append(f"stale_regime_signal:{age:.1f}s")
-
-            raw_ratio = regime.get("vix_ratio")
-            if raw_ratio is None:
-                raw_ratio = regime.get("ratio")
-            if raw_ratio is None:
-                vixy = regime.get("vixy_price")
-                vixm = regime.get("vixm_price")
-                if isinstance(vixy, (int, float)) and isinstance(vixm, (int, float)) and vixm > 0:
-                    raw_ratio = float(vixy) / float(vixm)
-            if isinstance(raw_ratio, (int, float)):
-                vix_ratio = float(raw_ratio)
-                if vix_ratio > self.config.vix_ratio_halt_threshold:
-                    reasons.append(f"vix_backwardation:{vix_ratio:.4f}>{self.config.vix_ratio_halt_threshold}")
-
-        # 3. Sleeve drawdown check from positions / equity snapshot
-        sleeve_dd_pct: float | None = None
-        pos_snap = _safe_json_load(self.rdb.get("mft:positions:latest"))
-        if pos_snap is not None:
-            raw_dd = pos_snap.get("drawdown_pct")
-            if isinstance(raw_dd, (int, float)):
-                sleeve_dd_pct = float(raw_dd)
-            else:
-                equity = pos_snap.get("equity")
-                hwm = pos_snap.get("high_water_mark")
-                if isinstance(equity, (int, float)) and isinstance(hwm, (int, float)) and hwm > 0:
-                    sleeve_dd_pct = ((float(equity) - float(hwm)) / float(hwm)) * 100.0
-            if sleeve_dd_pct is not None and sleeve_dd_pct <= self.config.max_drawdown_pct:
-                reasons.append(f"drawdown_breach:{sleeve_dd_pct:.2f}%<={self.config.max_drawdown_pct:.2f}%")
-
-        # 4. Surface freshness check
-        surface_ages_sec: dict[str, float | None] = {}
-        for surf_key in self.config.surface_keys:
-            surf = _safe_json_load(self.rdb.get(surf_key))
-            if surf is None:
-                surface_ages_sec[surf_key] = None
-                reasons.append(f"missing_surface:{surf_key}")
-            else:
-                age = _extract_age_sec(surf, now_ns)
-                surface_ages_sec[surf_key] = round(age, 2) if age is not None else None
-                if age is not None and age > self.config.max_surface_age_sec:
-                    reasons.append(f"stale_surface:{surf_key}:{age:.1f}s")
-
-        # 5. Realized volatility snapshot check
-        for rv_key in self.config.rv_keys:
-            rv = _safe_json_load(self.rdb.get(rv_key))
-            if rv is None:
-                reasons.append(f"missing_rv:{rv_key}")
-            else:
-                age = _extract_age_sec(rv, now_ns)
-                if age is not None and age > self.config.max_rv_age_sec:
-                    reasons.append(f"stale_rv:{rv_key}:{age:.0f}s")
-
-        halted = len(reasons) > 0
-        evaluation = RiskEvaluation(
-            halted=halted,
-            reasons=reasons,
-            evaluated_at_ns=now_ns,
-            evaluated_at_utc=_iso_utc(now_ns),
-            sleeve_drawdown_pct=round(sleeve_dd_pct, 4) if sleeve_dd_pct is not None else None,
-            vix_ratio=round(vix_ratio, 4) if vix_ratio is not None else None,
-            regime_age_sec=regime_age_sec,
-            surface_ages_sec=surface_ages_sec,
+    def read_inputs(self) -> RiskInputs:
+        store = self.store
+        return RiskInputs(
+            manual_halt_raw=store.get_text(keys.RISK_MANUAL_HALT),
+            regime=store.get_json_or_none(keys.REGIME_LATEST),
+            positions=store.get_json_or_none(keys.POSITIONS_LATEST),
+            surfaces={key: store.get_json_or_none(key) for key in self.config.surface_keys},
+            rvs={key: store.get_json_or_none(key) for key in self.config.rv_keys},
         )
 
-        payload_dict = asdict(evaluation)
-        payload_json = json.dumps(payload_dict)
-
-        pipe = self.rdb.pipeline()
-        pipe.set("mft:risk:halted", "1" if halted else "0")
-        pipe.set("mft:risk:status", payload_json)
-        pipe.lpush("mft:risk:history", payload_json)
-        pipe.ltrim("mft:risk:history", 0, self.config.history_max_len - 1)
-
-        state_changed = (self._prev_halted is None) or (halted != self._prev_halted) or (reasons != self._prev_reasons)
-        if state_changed:
-            transition_event = {
-                "event": "STATE_CHANGE",
-                "from_halted": self._prev_halted,
-                "to_halted": halted,
-                **payload_dict,
-            }
-            pipe.lpush("mft:risk:transitions", json.dumps(transition_event))
-            pipe.ltrim("mft:risk:transitions", 0, self.config.transitions_max_len - 1)
-            self._append_jsonl(transition_event)
-            self._last_disk_write_ns = now_ns
-        elif (now_ns - self._last_disk_write_ns) / 1e9 >= self.config.heartbeat_log_interval_sec:
-            self._append_jsonl({"event": "HEARTBEAT", **payload_dict})
-            self._last_disk_write_ns = now_ns
-
-        pipe.execute()
-        self._prev_halted = halted
-        self._prev_reasons = list(reasons)
+    def evaluate_once(self, now_ns: int | None = None) -> RiskEvaluation:
+        now_ns = now_ns if now_ns is not None else self.clock_ns()
+        evaluation = evaluate_risk(self.read_inputs(), self.config, now_ns)
+        self._publish(evaluation, now_ns)
         return evaluation
 
-    def run_forever(self) -> None:
-        signal.signal(signal.SIGINT, self.stop)
-        signal.signal(signal.SIGTERM, self.stop)
-        while self._running:
+    def _publish(self, evaluation: RiskEvaluation, now_ns: int) -> None:
+        payload = asdict(evaluation)
+        payload_json = json.dumps(payload)
+
+        batch = self.store.batch()
+        batch.set_text(keys.RISK_HALTED, "1" if evaluation.halted else "0", ttl_ms=self._ttl_ms)
+        batch.set_text(keys.RISK_STATUS, payload_json, ttl_ms=self._ttl_ms)
+        batch.push_capped(keys.RISK_HISTORY, payload_json, self.config.history_max_len)
+
+        kind, from_halted = self.transitions.classify(evaluation.halted, evaluation.reason_codes, now_ns)
+        if kind == TRANSITION:
+            transition_event = {
+                "event": "STATE_CHANGE",
+                "from_halted": from_halted,
+                "to_halted": evaluation.halted,
+                **payload,
+            }
+            batch.push_capped(keys.RISK_TRANSITIONS, transition_event, self.config.transitions_max_len)
+            self.sink.write(transition_event)
+        elif kind == HEARTBEAT:
+            self.sink.write({"event": "HEARTBEAT", **payload})
+
+        batch.execute()
+
+    def record_error(self, exc: BaseException) -> dict[str, Any]:
+        """Publishes a halted status for a failed evaluation; never raises."""
+        now_ns = self.clock_ns()
+        err_payload = {
+            "event": "DAEMON_ERROR",
+            "halted": True,
+            "reasons": [f"daemon_error:{type(exc).__name__}:{exc}"],
+            "reason_codes": ["daemon_error"],
+            "evaluated_at_ns": now_ns,
+            "evaluated_at_utc": iso_utc(now_ns),
+        }
+        # Ensures the recovery evaluation is logged as a transition
+        self.transitions.mark_error()
+        try:
+            self.store.set_text(keys.RISK_HALTED, "1", ttl_ms=self._ttl_ms)
+            self.store.set_json(keys.RISK_STATUS, err_payload, ttl_ms=self._ttl_ms)
+            self.store.push_capped(keys.RISK_TRANSITIONS, err_payload, self.config.transitions_max_len)
+        except Exception:
+            pass  # Valkey unreachable: the TTL'd keys expire, which the gate treats as halted
+        try:
+            self.sink.write(err_payload)
+        except Exception:
+            pass  # Disk trouble must not stop the daemon from publishing halts
+        return err_payload
+
+    def run_forever(self, max_iterations: int | None = None, install_signal_handlers: bool = True) -> None:
+        if install_signal_handlers:
+            signal.signal(signal.SIGINT, self.stop)
+            signal.signal(signal.SIGTERM, self.stop)
+        iterations = 0
+        while self._running and (max_iterations is None or iterations < max_iterations):
             try:
                 self.evaluate_once()
             except Exception as exc:
-                now_ns = time.time_ns()
-                err_payload = {
-                    "event": "DAEMON_ERROR",
-                    "halted": True,
-                    "reasons": [f"daemon_error:{type(exc).__name__}:{exc}"],
-                    "evaluated_at_ns": now_ns,
-                    "evaluated_at_utc": _iso_utc(now_ns),
-                }
-                self.rdb.set("mft:risk:halted", "1")
-                self.rdb.set("mft:risk:status", json.dumps(err_payload))
-                self.rdb.lpush("mft:risk:transitions", json.dumps(err_payload))
-                self._append_jsonl(err_payload)
-            time.sleep(self.config.poll_interval_sec)
+                self.record_error(exc)
+            iterations += 1
+            self.sleep(self.config.poll_interval_sec)
 
 
-def print_summary(valkey_url: str) -> None:
-    rdb = redis.from_url(valkey_url)
-    status = _safe_json_load(rdb.get("mft:risk:status"))
-    hist_len = rdb.llen("mft:risk:history")
-    trans_raw = rdb.lrange("mft:risk:transitions", 0, 14)
+def print_summary(target: str | JsonStore, echo: Callable[[str], None] = print) -> None:
+    """Prints the current status and recent transitions from a Valkey URL or an existing store."""
+    store = make_store(target) if isinstance(target, str) else target
+    status = store.get_json_or_none(keys.RISK_STATUS)
+    hist_len = store.list_len(keys.RISK_HISTORY)
 
-    print("=== Current Risk Status ===")
-    print(json.dumps(status, indent=2))
-    print(f"\n=== Rolling History Count: {hist_len} samples ===")
-    print("=== Recent State Transitions (newest first) ===")
-    for item in trans_raw:
-        t = _safe_json_load(item)
-        if t:
-            print(
-                f"  {t.get('evaluated_at_utc')} | halted={t.get('to_halted', t.get('halted'))} | "
-                f"vix_ratio={t.get('vix_ratio')} | regime_age={t.get('regime_age_sec')}s | "
-                f"reasons={t.get('reasons')}"
-            )
+    echo("=== Current Risk Status ===")
+    echo(json.dumps(status, indent=2))
+    echo(f"\n=== Rolling History Count: {hist_len} samples ===")
+    echo("=== Recent State Transitions (newest first) ===")
+    for t in store.get_json_list(keys.RISK_TRANSITIONS, 15):
+        echo(
+            f"  {t.get('evaluated_at_utc')} | halted={t.get('to_halted', t.get('halted'))} | "
+            f"vix_ratio={t.get('vix_ratio')} | regime_age={t.get('regime_age_sec')}s | "
+            f"reasons={t.get('reasons')}"
+        )
 
 
 def main() -> None:
@@ -251,7 +159,7 @@ def main() -> None:
     parser.add_argument("--summary", action="store_true", help="Print current status & recent transitions and exit")
     args = parser.parse_args()
 
-    valkey_url = os.environ.get("VALKEY_URL", "redis://127.0.0.1:6379/0")
+    valkey_url = os.environ.get("VALKEY_URL", DEFAULT_VALKEY_URL)
     if args.summary:
         print_summary(valkey_url)
         return
@@ -261,6 +169,7 @@ def main() -> None:
         poll_interval_sec=float(os.environ.get("RISK_POLL_INTERVAL_SEC", "2.0")),
         max_drawdown_pct=float(os.environ.get("RISK_MAX_DRAWDOWN_PCT", "-5.0")),
         vix_ratio_halt_threshold=float(os.environ.get("RISK_VIX_RATIO_THRESHOLD", "1.0")),
+        state_ttl_sec=float(os.environ.get("RISK_STATE_TTL_SEC", "10.0")),
     )
     daemon = OutOfProcessRiskDaemon(cfg)
     daemon.run_forever()

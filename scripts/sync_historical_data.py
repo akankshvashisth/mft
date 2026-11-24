@@ -2,31 +2,26 @@ import os
 import sys
 from pathlib import Path
 from dotenv import load_dotenv
-from nautilus_trader.model import InstrumentId
-from src.data.catalog_loader import (
-    fetch_databento_dbn,
-    fetch_thetadata_eod_bars,
-    ingest_databento_to_catalog,
-    preview_databento_cost,
-)
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.runtime.instruments import SPY_ID, SYNC_UNIVERSE, split_instrument_id  # noqa: E402
 
 load_dotenv()
 
-UNIVERSE = [
-    ("SPY", "ARCA"),
-    ("QQQ", "NASDAQ"),
-    ("IWM", "ARCA"),
-    ("XBI", "ARCA"),
-    ("GDX", "ARCA"),
-    ("SMH", "NASDAQ"),
-    ("TLT", "NASDAQ"),
-    ("GLD", "ARCA"),
-    ("VIXY", "ARCA"),
-    ("VIXM", "ARCA"),
-]
+UNIVERSE = [split_instrument_id(instrument_id) for instrument_id in SYNC_UNIVERSE]
 
 
 def main() -> None:
+    # The catalog loaders are not in the repository yet, so they are imported only when the script runs
+    from nautilus_trader.model import InstrumentId
+    from src.data.catalog_loader import (
+        fetch_databento_dbn,
+        fetch_thetadata_eod_bars,
+        ingest_databento_to_catalog,
+        preview_databento_cost,
+    )
+
     print("=== 1. Syncing 1-Year EOD Universe Bars & Realized Volatility (ThetaData Free -> Catalog + Valkey) ===")
     for sym, venue in UNIVERSE:
         try:
@@ -65,7 +60,7 @@ def main() -> None:
                     end="2026-11-22",
                     max_cost_usd=2.50,
                 )
-                n_bars = ingest_databento_to_catalog(dbn_path, InstrumentId.from_str("SPY.ARCA"))
+                n_bars = ingest_databento_to_catalog(dbn_path, InstrumentId.from_str(SPY_ID))
                 print(f"  Cached {dbn_path} & ingested {n_bars:,} 1-min bars into catalog/")
         except Exception as exc:
             print(f"  Databento sync skipped/error: {exc}")

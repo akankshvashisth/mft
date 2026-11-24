@@ -1,11 +1,19 @@
 import os
-os.environ.setdefault("TRITON_DEFAULT_FP_FUSION", "1")
+import sys
+from pathlib import Path
 
-import time
-import numpy as np
-import torch
-import fast_vollib
-from fast_vollib.surface import IVSurface
+os.environ.setdefault("TRITON_DEFAULT_FP_FUSION", "1")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import time  # noqa: E402
+
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+import fast_vollib  # noqa: E402
+from fast_vollib.surface import IVSurface  # noqa: E402
+
+from src.quant.quote_hygiene import clean_quote_mask  # noqa: E402
+from src.quant.risk_measures import tail_metrics  # noqa: E402
 
 
 def sync_if_cuda(backend: str) -> None:
@@ -25,16 +33,7 @@ def filter_clean_quotes(
     max_abs_k: float = 0.45,
 ) -> tuple[np.ndarray, ...]:
     """Production pre-solver hygiene gate: strips zero-bid/subnormal, intrinsic-violating, and extreme-wing quotes."""
-    disc = np.exp(-r * t)
-    intrinsic = np.where(flag == "c", np.maximum(S - K * disc, 0.0), np.maximum(K * disc - S, 0.0))
-    log_m = np.abs(np.log(K / S))
-
-    valid = (
-        np.isfinite(prices)
-        & (prices > np.maximum(intrinsic + 1e-4, min_price))
-        & (prices < S - 1e-4)
-        & (log_m <= max_abs_k)
-    )
+    valid = clean_quote_mask(S, K, t, r, prices, flag, min_price=min_price, max_abs_log_moneyness=max_abs_k)
     return S[valid], K[valid], t[valid], r[valid], prices[valid], flag[valid], true_sigma[valid]
 
 
@@ -135,17 +134,16 @@ def bench_combo_risk(n_scenarios: int = 25_000, backend: str = "torch") -> dict:
         backend=backend, return_as="numpy",
     ).reshape(4, n_scenarios)
     pnl = (np.sum(qtys[:, None] * vals_H, axis=0) * 100.0) - entry_cost
-    var_95 = float(np.percentile(pnl, 5))
-    es_95 = float(np.mean(pnl[pnl <= var_95]))
+    tail = tail_metrics(pnl)
     sync_if_cuda(backend)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     return {
         "ms": elapsed_ms,
-        "ev": float(np.mean(pnl)),
-        "pop": float(np.mean(pnl > 0) * 100.0),
-        "var_95": var_95,
-        "es_95": es_95,
+        "ev": tail.mean,
+        "pop": tail.prob_profit * 100.0,
+        "var_95": tail.var_95,
+        "es_95": tail.es_95,
     }
 
 

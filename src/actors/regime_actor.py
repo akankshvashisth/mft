@@ -1,10 +1,15 @@
 import time
-from datetime import timedelta
-import json
-import redis
+
 from nautilus_trader.common import DataActor, DataActorConfig
-from nautilus_trader.model import CustomData, DataType, InstrumentId, QuoteTick
+from nautilus_trader.model import Bar, InstrumentId, QuoteTick
+
+from src.adapters.extract import plain_settings
+from src.adapters.nautilus import bar_obs, minute_bar_type, quote_obs
+from src.adapters.ports import ActorPorts, PortsLog
+from src.common.constants import DEFAULT_VALKEY_URL
+from src.common.store import make_store
 from src.models.vol_surface import MacroRegimeSignal
+from src.services.regime import RegimeService, RegimeSettings
 
 
 class MacroRegimeActorConfig(DataActorConfig):
@@ -12,10 +17,12 @@ class MacroRegimeActorConfig(DataActorConfig):
         self,
         vix_id: InstrumentId,
         vix3m_id: InstrumentId,
-        backwardation_gate: float = 1.00,
-        interval_secs: int = 15,
-        max_quote_age_secs: float = 90.0,
-        valkey_url: str = "redis://127.0.0.1:6379/0",
+        backwardation_gate: float = RegimeSettings.backwardation_gate,
+        interval_secs: int = RegimeSettings.interval_secs,
+        max_quote_age_secs: float = RegimeSettings.max_quote_age_secs,
+        use_quotes: bool = RegimeSettings.use_quotes,
+        use_bars: bool = RegimeSettings.use_bars,
+        valkey_url: str = DEFAULT_VALKEY_URL,
     ) -> None:
         super().__init__()
         self.vix_id = vix_id
@@ -23,90 +30,55 @@ class MacroRegimeActorConfig(DataActorConfig):
         self.backwardation_gate = backwardation_gate
         self.interval_secs = interval_secs
         self.max_quote_age_secs = max_quote_age_secs
+        self.use_quotes = use_quotes
+        self.use_bars = use_bars
         self.valkey_url = valkey_url
 
 
 class MacroRegimeActor(DataActor):
-    """Monitors volatility term structure with feed-staleness gating."""
+    """Monitors the VIX / VIX3M index term structure with feed-staleness gating (logic: RegimeService).
+
+    The ratio is only meaningful for the indices themselves (^VIX.CBOE / ^VIX3M.CBOE). Cash indices
+    carry no two-sided quotes, so levels are also taken from 1-minute LAST bars when use_bars is set.
+    """
 
     def __init__(self, config: MacroRegimeActorConfig) -> None:
         super().__init__(config)
-        self.vix_mid: float | None = None
-        self.vix3m_mid: float | None = None
-        self.vix_ts_ns: int = 0
-        self.vix3m_ts_ns: int = 0
-        self.rdb = redis.from_url(config.valkey_url) if config.valkey_url else None
+        self.ports = ActorPorts(self)
+        self.core = RegimeService(
+            plain_settings(config, RegimeSettings), store=make_store(config.valkey_url), log=PortsLog(self)
+        )
+        self.wall_clock_ns = time.time_ns
 
     def on_start(self) -> None:
-        self.subscribe_quotes(self.config.vix_id)
-        self.subscribe_quotes(self.config.vix3m_id)
-        self.clock.set_timer(
-            "regime_eval",
-            timedelta(seconds=self.config.interval_secs),
-            callback=self.on_timer,
-        )
-        self.log.info(
-            f"MacroRegimeActor subscribed to {self.config.vix_id} & {self.config.vix3m_id}"
+        s = self.core.settings
+        for iid in (s.vix_id, s.vix3m_id):
+            if s.use_quotes:
+                self.ports.subscribe_quotes(iid)
+            if s.use_bars:
+                self.ports.subscribe_bars(minute_bar_type(iid))
+        self.ports.set_timer("regime_eval", s.interval_secs, self.on_timer)
+        self.ports.info(
+            f"MacroRegimeActor subscribed to {s.vix_id} & {s.vix3m_id} (quotes={s.use_quotes}, bars={s.use_bars})"
         )
 
     def on_quote(self, tick: QuoteTick) -> None:
-        bid = float(tick.bid_price)
-        ask = float(tick.ask_price)
-        if bid <= 0.0 or ask <= 0.0 or ask < bid:
-            return
-        mid = 0.5 * (bid + ask)
-        ts_ns = int(tick.ts_event)
-        if tick.instrument_id == self.config.vix_id:
-            self.vix_mid = mid
-            self.vix_ts_ns = ts_ns
-        elif tick.instrument_id == self.config.vix3m_id:
-            self.vix3m_mid = mid
-            self.vix3m_ts_ns = ts_ns
+        self.core.on_quote(quote_obs(tick))
+
+    def on_bar(self, bar: Bar) -> None:
+        self.core.on_bar(bar_obs(bar))
 
     def on_timer(self, event) -> None:
-        if self.vix_mid is None or self.vix3m_mid is None or self.vix3m_mid <= 0.0:
-            self.log.info(
-                f"MacroRegimeActor timer tick: vix={self.vix_mid}, vix3m={self.vix3m_mid}"
-            )
+        event_ts_ns = int(event.ts_event)
+        state = self.core.evaluate(event_ts_ns=event_ts_ns, wall_ns=self.wall_clock_ns())
+        if state is None:
             return
-
-        now_ns = int(event.ts_event)
-        vix_age = (now_ns - self.vix_ts_ns) / 1e9
-        vix3m_age = (now_ns - self.vix3m_ts_ns) / 1e9
-        is_stale = max(vix_age, vix3m_age) > self.config.max_quote_age_secs
-
-        ratio = self.vix_mid / self.vix3m_mid
-        allowed = (not is_stale) and (ratio <= self.config.backwardation_gate)
-
         signal = MacroRegimeSignal(
-            vix=self.vix_mid,
-            vix3m=self.vix3m_mid,
-            ratio=ratio,
-            short_vol_allowed=allowed,
-            ts_event=now_ns,
-            ts_init=self.clock.timestamp_ns(),
+            vix=state.vix,
+            vix3m=state.vix3m,
+            ratio=state.ratio,
+            short_vol_allowed=state.short_vol_allowed,
+            ts_event=event_ts_ns,
+            ts_init=self.ports.now_ns(),
         )
-        self.publish_data(
-            DataType("MacroRegimeSignal"),
-            CustomData(DataType("MacroRegimeSignal"), signal),
-        )
-        if self.rdb is not None:
-            self.rdb.set(
-                "mft:regime:latest",
-                json.dumps(
-                    {
-                        "vix": round(self.vix_mid, 2),
-                        "vix3m": round(self.vix3m_mid, 2),
-                        "ratio": round(ratio, 4),
-                        "short_vol_allowed": allowed,
-                        "is_stale": is_stale,
-                        "max_age_secs": round(max(vix_age, vix3m_age), 2),
-                        "ts_ns": time.time_ns(),
-                        "event_ts_ns": now_ns,
-                    }
-                ),
-            )
-        self.log.info(
-            f"Regime VIX={self.vix_mid:.2f} VIX3M={self.vix3m_mid:.2f} "
-            f"ratio={ratio:.3f} stale={is_stale} short_vol_allowed={allowed}"
-        )
+        self.ports.publish_custom("MacroRegimeSignal", signal)

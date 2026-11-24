@@ -1,45 +1,28 @@
 import argparse
 import sys
-from nautilus_trader.adapters.interactive_brokers import (
-    InteractiveBrokersDataClientConfig,
-    InteractiveBrokersDataClientFactory,
-    InteractiveBrokersInstrumentProviderConfig,
-    MarketDataType,
-    SymbologyMethod,
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.runtime.ib_node import (  # noqa: E402
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    build_live_node,
+    data_client_config,
+    instrument_provider_config,
 )
-from nautilus_trader.config import LiveNodeConfig
-from nautilus_trader.live import LiveNodeBuilder
-from nautilus_trader.model import InstrumentId, TraderId
 
 
 def probe_symbol(
     symbol: str,
-    host: str = "127.0.0.1",
-    port: int = 4002,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
     client_id: int = 9,
 ) -> bool:
-    iid = InstrumentId.from_str(symbol)
-    trader_name = "MFT-PROBE"
-    cfg = LiveNodeConfig(
-        trader_id=TraderId(trader_name),
-        data_clients={
-            "IB": InteractiveBrokersDataClientConfig(
-                host=host,
-                port=port,
-                client_id=client_id,
-                market_data_type=MarketDataType.DELAYED_FROZEN,
-                instrument_provider=InteractiveBrokersInstrumentProviderConfig(
-                    symbology_method=SymbologyMethod.SIMPLIFIED,
-                    load_ids=frozenset([iid]),
-                ),
-            )
-        },
+    node = build_live_node(
+        "MFT-PROBE",
+        data_client_config(instrument_provider_config([symbol]), host=host, port=port, client_id=client_id),
     )
-    node = LiveNodeBuilder.from_config(
-        trader_name,
-        cfg,
-        data_factories={"IB": InteractiveBrokersDataClientFactory()},
-    ).build()
     try:
         node.run()
         return True
@@ -62,8 +45,8 @@ def main() -> None:
         nargs="+",
         help='InstrumentId strings, e.g. "VIX.CBOE" "SPY 261218P00690000.SMART"',
     )
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=4002)
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--client-id", type=int, default=9)
     args = parser.parse_args()
 

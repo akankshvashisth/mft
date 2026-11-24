@@ -1,17 +1,46 @@
 from __future__ import annotations
 
-import json
-import math
 import os
+import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import redis
 import streamlit as st
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.common.constants import DEFAULT_VALKEY_URL  # noqa: E402
+from src.common.keys import instrument_from_surface_key  # noqa: E402
+from src.common.store import JsonStore, make_store  # noqa: E402
+from src.dashboard.formatting import fmt as _fmt  # noqa: E402
+from src.dashboard.state import (  # noqa: E402
+    DEFAULT_SURFACE_KEY,
+    age_seconds,
+    load_live_state,
+    manual_halt_engaged,
+    set_manual_halt,
+    surface_keys as list_surface_keys,
+)
+from src.dashboard.views import (  # noqa: E402
+    actor_health_rows,
+    attribution_rows,
+    banner,
+    decision_matrix_rows,
+    dense_smile,
+    forward_comparison_rows,
+    risk_transition_rows,
+    smile_density,
+    surface_forward,
+    svi_parameter_rows,
+    universe_rv_rows,
+    universe_snapshot_rows,
+    vrp_spread,
+)
 
 st.set_page_config(
     page_title="Institutional VRP & Surface Command Center",
@@ -20,85 +49,19 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-VALKEY_URL = os.environ.get("VALKEY_URL", "redis://127.0.0.1:6379/0")
+VALKEY_URL = os.environ.get("VALKEY_URL", DEFAULT_VALKEY_URL)
 
 
 @st.cache_resource
-def get_redis() -> redis.Redis:
-    return redis.from_url(VALKEY_URL)
-
-
-def load_json(rdb: redis.Redis, key: str) -> dict[str, Any] | None:
-    raw = rdb.get(key)
-    if not raw:
-        return None
-    try:
-        val = json.loads(raw.decode("utf-8"))
-        return val if isinstance(val, dict) else None
-    except Exception:
-        return None
-
-
-def load_json_list(rdb: redis.Redis, key: str, count: int = 200) -> list[dict[str, Any]]:
-    items = rdb.lrange(key, 0, count - 1)
-    out: list[dict[str, Any]] = []
-    for item in items:
-        try:
-            obj = json.loads(item.decode("utf-8"))
-            if isinstance(obj, dict):
-                out.append(obj)
-        except Exception:
-            pass
-    return out
-
-
-def _norm_cdf(x: np.ndarray) -> np.ndarray:
-    return 0.5 * (1.0 + np.vectorize(math.erf)(x / math.sqrt(2.0)))
-
-
-def _bs_price(
-    F: float, K: np.ndarray, T: float, sigma: np.ndarray, r: float = 0.0425, is_call: bool = True
-) -> np.ndarray:
-    T_eff = max(T, 1e-6)
-    sig_eff = np.maximum(sigma, 1e-6)
-    vol_sqrt_t = sig_eff * np.sqrt(T_eff)
-    d1 = (np.log(F / K) + 0.5 * (sig_eff ** 2) * T_eff) / vol_sqrt_t
-    d2 = d1 - vol_sqrt_t
-    df = math.exp(-r * T_eff)
-    if is_call:
-        return df * (F * _norm_cdf(d1) - K * _norm_cdf(d2))
-    return df * (K * _norm_cdf(-d2) - F * _norm_cdf(-d1))
-
-
-def _bs_delta(
-    F: float, K: np.ndarray, T: float, sigma: np.ndarray, r: float = 0.0425, is_call: bool = True
-) -> np.ndarray:
-    T_eff = max(T, 1e-6)
-    sig_eff = np.maximum(sigma, 1e-6)
-    d1 = (np.log(F / K) + 0.5 * (sig_eff ** 2) * T_eff) / (sig_eff * np.sqrt(T_eff))
-    df = math.exp(-r * T_eff)
-    return df * _norm_cdf(d1) if is_call else df * (_norm_cdf(d1) - 1.0)
-
-
-def _eval_svi_iv(k: np.ndarray, svi_params: list[float], T: float) -> np.ndarray:
-    a, b, rho, m, sigma = svi_params
-    dk = k - m
-    w = np.maximum(a + b * (rho * dk + np.sqrt(dk * dk + sigma * sigma)), 1e-8)
-    return np.sqrt(w / max(T, 1e-6))
+def get_store() -> JsonStore:
+    return make_store(VALKEY_URL)
 
 
 def _age_seconds(obj: dict[str, Any] | None) -> float | None:
-    if not obj:
-        return None
-    now_ns = time.time_ns()
-    for field in ("ts_ns", "event_ts_ns", "ts_event"):
-        val = obj.get(field)
-        if isinstance(val, (int, float)) and val > 1e15:
-            return round(max(0.0, (now_ns - float(val)) / 1e9), 1)
-    return None
+    return age_seconds(obj, time.time_ns())
 
 
-rdb = get_redis()
+store = get_store()
 
 # --- Shared Sidebar Controls ---
 with st.sidebar:
@@ -113,20 +76,17 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Fail-Closed Kill-Switch")
-    manual_halt_raw = rdb.get("mft:risk:manual_halt")
-    manual_halted = bool(
-        manual_halt_raw and manual_halt_raw.decode("utf-8").strip().lower() in {"1", "true", "yes", "on"}
-    )
+    manual_halted = manual_halt_engaged(store)
 
     if manual_halted:
         st.error("MANUAL HALT ENGAGED (`mft:risk:manual_halt=1`)")
         if st.button("Release Manual Kill-Switch", type="primary", use_container_width=True):
-            rdb.delete("mft:risk:manual_halt")
+            set_manual_halt(store, False)
             st.rerun()
     else:
         st.success("Manual Kill-Switch Disarmed")
         if st.button("ENGAGE MANUAL KILL-SWITCH", type="secondary", use_container_width=True):
-            rdb.set("mft:risk:manual_halt", "1")
+            set_manual_halt(store, True)
             st.rerun()
 
     st.caption(
@@ -135,47 +95,22 @@ with st.sidebar:
     )
 
     st.divider()
-    surface_keys = sorted(k.decode("utf-8") for k in rdb.keys("mft:surface:*"))
+    surface_keys = list_surface_keys(store)
     selected_surface_key = st.selectbox(
         "Active Underlying Surface",
-        options=surface_keys or ["mft:surface:SPY.ARCA"],
+        options=surface_keys or [DEFAULT_SURFACE_KEY],
         help="Selects the primary underlying symbol inspected across the Overview, FastVolActor, and SurfaceMetrics pages.",
     )
-    underlying_sym = selected_surface_key.replace("mft:surface:", "")
+    underlying_sym = instrument_from_surface_key(selected_surface_key)
 
 # --- Shared Live State Loader ---
 def get_live_state() -> dict[str, Any]:
-    return {
-        "regime": load_json(rdb, "mft:regime:latest"),
-        "futures": load_json(rdb, "mft:futures:latest"),
-        "vrp_strat": load_json(rdb, "mft:strategy:vrp:latest"),
-        "surface": load_json(rdb, selected_surface_key),
-        "rv_primary": load_json(rdb, f"mft:rv:{underlying_sym}"),
-        "rv_universe": load_json(rdb, "mft:rv:universe"),
-        "metrics": load_json(rdb, f"mft:metrics:{underlying_sym}"),
-        "portfolio": load_json(rdb, "mft:portfolio:risk"),
-        "risk_status": load_json(rdb, "mft:risk:status"),
-        "risk_history": load_json_list(rdb, "mft:risk:history", count=200),
-        "risk_transitions": load_json_list(rdb, "mft:risk:transitions", count=30),
-    }
+    return load_live_state(store, selected_surface_key)
 
 
 def render_global_banner(state: dict[str, Any]) -> None:
-    risk_status = state["risk_status"]
-    regime = state["regime"]
-    surface = state["surface"]
-    metrics = state["metrics"]
-
-    if risk_status is None:
-        st.warning("Risk Daemon heartbeat missing (`mft:risk:status`). Ensure `src.risk.risk_daemon` is running.")
-    elif risk_status.get("halted"):
-        st.error(f"**SYSTEM HALTED** — Active Reasons: `{', '.join(risk_status.get('reasons', []))}`")
-    else:
-        bias = (metrics or {}).get("strategy_bias", "CALIBRATING")
-        st.success(
-            f"**SYSTEM ARMED & STREAMING** | Regime Age: `{_age_seconds(regime)}s` | "
-            f"Surface Age: `{_age_seconds(surface)}s` | Active Bias: **{bias}**"
-        )
+    level, text = banner(state, time.time_ns())
+    {"warning": st.warning, "error": st.error, "success": st.success}[level](text)
 
 
 # ==============================================================================
@@ -199,12 +134,9 @@ def page_overview() -> None:
     # Row 1: Core Cross-Actor KPIs
     atm_iv = surface.get("atm_iv")
     rv_20d = rv.get("rv_20d")
-    vrp = metrics.get("vrp_spread") if metrics.get("vrp_spread") is not None else (
-        (atm_iv - rv_20d) if (atm_iv is not None and rv_20d is not None) else None
-    )
+    vrp = vrp_spread(surface, rv, metrics)
     ratio = regime.get("ratio")
     arb_free = surface.get("arb_free")
-    greeks = port.get("greeks") or {}
     risk_p = port.get("risk") or {}
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -283,63 +215,7 @@ def page_overview() -> None:
 
     # Row 2: Actor Health & Architecture Matrix
     st.subheader("Live Actor Bus Health & Outputs")
-    actor_rows = [
-        {
-            "Actor": "1. MacroRegimeActor",
-            "Role": "Term-Structure & Stress Gate",
-            "Age (s)": _age_seconds(regime),
-            "Primary Output": (
-                f"VIX={regime.get('vix')} | VIX3M={regime.get('vix3m')} | Ratio={regime.get('ratio')} | "
-                f"ShortVolAllowed={regime.get('short_vol_allowed')}"
-                if regime
-                else "Waiting..."
-            ),
-        },
-        {
-            "Actor": "2. FastVolActor",
-            "Role": "SVI Calibration & Arb Validation",
-            "Age (s)": _age_seconds(surface),
-            "Primary Output": (
-                f"Spot=${surface.get('spot')} | Fwd=${surface.get('forward')} | ATM_IV={surface.get('atm_iv', 0):.2%} | "
-                f"RMSE={surface.get('rmse_vol_pts')}pts | ArbFree={surface.get('arb_free')}"
-                if surface
-                else "Waiting..."
-            ),
-        },
-        {
-            "Actor": "3. RealizedVolActor",
-            "Role": "P-Measure RV, Jumps & Correlation",
-            "Age (s)": _age_seconds(rv),
-            "Primary Output": (
-                f"RV5={rv.get('rv_5d', 0):.2%} | RV20={rv.get('rv_20d', 0):.2%} | Pct={rv.get('rv_percentile')}% | "
-                f"Jump={rv.get('jump_ratio', 0):.1%} | 8-ETF Corr={rv.get('avg_pair_corr')}"
-                if rv
-                else "Waiting..."
-            ),
-        },
-        {
-            "Actor": "4. SurfaceRegimeMetricsActor",
-            "Role": "Skew/Butterfly, VRP & Strategy Bias",
-            "Age (s)": _age_seconds(metrics),
-            "Primary Output": (
-                f"RR25={metrics.get('rr_25d', 0):+.2%} | BF25={metrics.get('bf_25d', 0):+.2%} | "
-                f"VRP={metrics.get('vrp_spread', 0):+.2%} | Bias={metrics.get('strategy_bias')}"
-                if metrics
-                else "Waiting..."
-            ),
-        },
-        {
-            "Actor": "5. PortfolioAnalyticsActor",
-            "Role": "Book Greeks, Stress Grid & Attribution",
-            "Age (s)": _age_seconds(port),
-            "Primary Output": (
-                f"Open={port.get('open_positions', 0)} | BetaDelta={greeks.get('beta_delta_shares', 0):+.1f}sh | "
-                f"Vega=${greeks.get('net_vega_1v_usd', 0):+.2f}/v | Theta=${greeks.get('net_theta_day_usd', 0):+.2f}/d"
-                if port
-                else "Waiting..."
-            ),
-        },
-    ]
+    actor_rows = actor_health_rows(regime, surface, rv, metrics, port, time.time_ns())
     st.dataframe(pd.DataFrame(actor_rows), hide_index=True, use_container_width=True)
 
     # Row 3: Quick Smile + Universe RV Snapshot
@@ -367,16 +243,7 @@ def page_overview() -> None:
     with right_c:
         rv_univ = state["rv_universe"] or {}
         if rv_univ:
-            u_rows = [
-                {
-                    "Symbol": sym.split(".")[0],
-                    "RV 5d": f"{v.get('rv_5d', 0):.1%}",
-                    "RV 20d": f"{v.get('rv_20d', 0):.1%}",
-                    "1Y Pct": f"{v.get('rv_percentile', 0):.0f}%",
-                    "Jump %": f"{v.get('jump_ratio', 0):.0%}",
-                }
-                for sym, v in sorted(rv_univ.items(), key=lambda kv: kv[1].get("rv_percentile", 0), reverse=True)
-            ]
+            u_rows = universe_snapshot_rows(rv_univ)
             st.markdown("**8-ETF Realized Vol Snapshot (`RealizedVolActor`)**")
             st.dataframe(pd.DataFrame(u_rows), hide_index=True, use_container_width=True, height=300)
 
@@ -391,7 +258,7 @@ def page_macro_regime() -> None:
 
     st.title("1. MacroRegimeActor — Volatility Term Structure & Stress Gate")
     st.markdown(
-        "Monitors front-month implied volatility (`VIX` / `VIXY`) against 3-month volatility (`VIX3M` / `VIXM`) "
+        "Monitors the CBOE `VIX` index (30-day implied volatility) against `VIX3M` (93-day) "
         "to detect term-structure inversion (backwardation) before short-volatility entries are permitted."
     )
     render_global_banner(state)
@@ -557,11 +424,11 @@ def page_fast_vol() -> None:
     svi_iv_arr = np.asarray(surface["ivs"], dtype=float) * 100.0
     raw_iv_arr = np.asarray(surface["raw_ivs"], dtype=float) * 100.0
     resid_pts = raw_iv_arr - svi_iv_arr
-    fwd = float(surface.get("forward", surface.get("spot", 700.0)))
+    fwd = surface_forward(surface)
     spot_px = float(surface.get("spot", fwd))
-    ttm_years = max(float(surface.get("ttm_days", 25.0)) / 365.25, 1e-4)
     approx_strikes = fwd * np.exp(k_arr)
     svi_p = surface.get("svi_params", [])
+    smile_curve = dense_smile(surface)
 
     left_col, right_col = st.columns([2.2, 1.0])
     with left_col:
@@ -576,9 +443,8 @@ def page_fast_vol() -> None:
                 "Calibration Residuals (Market Mid IV − SVI Model IV, in Vol Pts)",
             ),
         )
-        if len(svi_p) == 5:
-            k_dense = np.linspace(float(k_arr.min()) - 0.01, float(k_arr.max()) + 0.01, 120)
-            svi_dense_iv = _eval_svi_iv(k_dense, svi_p, ttm_years) * 100.0
+        if smile_curve is not None:
+            k_dense, svi_dense_iv = smile_curve
             fig_fit.add_trace(
                 go.Scatter(
                     x=k_dense,
@@ -621,17 +487,7 @@ def page_fast_vol() -> None:
             help="w(k) = a + b * (ρ*(k - m) + sqrt((k - m)^2 + σ^2)).",
         )
         if len(svi_p) == 5:
-            lee_util = (float(svi_p[1]) * (1.0 + abs(float(svi_p[2])))) / 2.0
-            st.dataframe(
-                pd.DataFrame(
-                    {
-                        "Parameter": ["a (variance level)", "b (wing slope)", "ρ (skew tilt)", "m (center shift)", "σ (ATM curvature)", "Roger Lee Bound"],
-                        "Value": [f"{svi_p[0]:.6f}", f"{svi_p[1]:.6f}", f"{svi_p[2]:.6f}", f"{svi_p[3]:.6f}", f"{svi_p[4]:.6f}", f"{lee_util:.1%}"],
-                    }
-                ),
-                hide_index=True,
-                use_container_width=True,
-            )
+            st.dataframe(pd.DataFrame(svi_parameter_rows(svi_p)), hide_index=True, use_container_width=True)
 
         st.markdown(
             "**Pre-Solver Hygiene Filter Counts**",
@@ -639,16 +495,10 @@ def page_fast_vol() -> None:
         )
         st.json(surface.get("dropped", {}))
 
-    if len(svi_p) == 5:
+    density = smile_density(surface)
+    if density is not None:
         st.subheader("Breeden-Litzenberger Risk-Neutral Implied Density q(K)")
-        k_grid = np.linspace(-0.18, 0.14, 240)
-        K_grid = fwd * np.exp(k_grid)
-        iv_grid = _eval_svi_iv(k_grid, svi_p, ttm_years)
-        C_grid = _bs_price(fwd, K_grid, ttm_years, iv_grid, r=0.0425, is_call=True)
-        pdf_q = np.maximum(math.exp(0.0425 * ttm_years) * np.gradient(np.gradient(C_grid, K_grid), K_grid), 0.0)
-        area = float(np.trapezoid(pdf_q, K_grid)) if hasattr(np, "trapezoid") else float(np.trapz(pdf_q, K_grid))
-        if area > 0:
-            pdf_q = pdf_q / area
+        K_grid, pdf_q = density
 
         fig_pdf = go.Figure()
         fig_pdf.add_trace(go.Scatter(x=K_grid, y=pdf_q, mode="lines", fill="tozeroy", name="SVI Density q(K)", line=dict(color="#00CC96")))
@@ -732,21 +582,7 @@ def page_realized_vol() -> None:
 
     st.divider()
     if rv_univ:
-        rows = []
-        for sym, d in rv_univ.items():
-            rows.append(
-                {
-                    "Symbol": sym,
-                    "Spot / Close": d.get("spot"),
-                    "RV 5d (%)": round(float(d.get("rv_5d", 0)) * 100, 2),
-                    "RV 10d (%)": round(float(d.get("rv_10d", 0)) * 100, 2),
-                    "RV 20d (%)": round(float(d.get("rv_20d", 0)) * 100, 2),
-                    "RV 60d (%)": round(float(d.get("rv_60d", 0)) * 100, 2),
-                    "1Y Percentile": d.get("rv_percentile"),
-                    "Jump Ratio (%)": round(float(d.get("jump_ratio", 0)) * 100, 1),
-                }
-            )
-        df_u = pd.DataFrame(rows).sort_values("1Y Percentile", ascending=False)
+        df_u = pd.DataFrame(universe_rv_rows(rv_univ)).sort_values("1Y Percentile", ascending=False)
 
         c_tbl, c_cht = st.columns([1.35, 1.0])
         with c_tbl:
@@ -856,15 +692,7 @@ def page_surface_metrics() -> None:
         )
 
     with st.expander("Decision Matrix Rules (`SurfaceRegimeMetricsActor`)", expanded=True):
-        rules_df = pd.DataFrame(
-            [
-                {"Regime Condition": "VIX/VIX3M >= 1.00 OR VRP < -1.5%", "Assigned Bias": "DEFENSIVE_OR_LONG_CONVEXITY", "Action": "Stand down short-vol; favor long convexity / hedges"},
-                {"Regime Condition": "VRP >= +2.0% AND BF25 >= +0.5%", "Assigned Bias": "SHORT_VRP_IRON_CONDOR_OR_CREDIT_SPREAD", "Action": "Harvest rich ATM & wing premium via defined-risk spreads"},
-                {"Regime Condition": "RR25 Percentile <= 20%", "Assigned Bias": "BULLISH_RISK_REVERSAL_OR_PUT_SPREAD", "Action": "Exploit compressed put skew for upside asymmetry"},
-                {"Regime Condition": "Balanced Contango & Moderate VRP", "Assigned Bias": "SELECTIVE_RELATIVE_VALUE_SPREADS", "Action": "Trade only top SurfaceScanner residual dislocations"},
-            ]
-        )
-        st.dataframe(rules_df, hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(decision_matrix_rows()), hide_index=True, use_container_width=True)
 
 
 # ==============================================================================
@@ -964,15 +792,7 @@ def page_portfolio_analytics() -> None:
 
     with right_g:
         st.subheader("Daily Greeks P&L Attribution")
-        attr_rows = [
-            {"Component": "Actual P&L Change", "USD ($)": f"${attr.get('actual_pnl_change_usd', 0):+.2f}"},
-            {"Component": "Delta Explain (Δ · ΔS)", "USD ($)": f"${attr.get('delta_pnl_usd', 0):+.2f}"},
-            {"Component": "Gamma Explain (½Γ · ΔS²)", "USD ($)": f"${attr.get('gamma_pnl_usd', 0):+.2f}"},
-            {"Component": "Vega Explain (𝒱 · Δσ)", "USD ($)": f"${attr.get('vega_pnl_usd', 0):+.2f}"},
-            {"Component": "Theta Explain (Θ · Δt)", "USD ($)": f"${attr.get('theta_pnl_usd', 0):+.2f}"},
-            {"Component": "Unexplained Residual", "USD ($)": f"${attr.get('residual_pnl_usd', 0):+.2f}"},
-        ]
-        st.dataframe(pd.DataFrame(attr_rows), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(attribution_rows(attr)), hide_index=True, use_container_width=True)
 
     positions = port.get("positions") or []
     st.subheader("Open Position Marks & Leg Greeks")
@@ -1003,16 +823,22 @@ def page_futures_basis() -> None:
         st.info("Waiting for `mft:futures:latest` from `FuturesContextActor` (restart `run_paper.py` to activate `MESZ26.CME` & `MNQZ26.CME`)...")
         return
 
+    if not fut.get("cross_check_valid"):
+        st.warning(
+            f"Parity-vs-futures cross-check unavailable (SPX/SPY ratio: `{fut.get('ratio_source', 'UNAVAILABLE')}`). "
+            "It needs live `^SPX.CBOE` bars plus a fresh SVI surface; `PreTradeGate` skips this check meanwhile."
+        )
+
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         st.metric(
             "MES Futures / Scaled Fwd",
-            f"{fut.get('mes_quote', 0):.2f}",
-            delta=f"SPY-Eq Fwd: ${fut.get('mes_scaled_fwd', 0):.2f} (Divisor: {fut.get('spx_spy_ratio', 10.0):.4f})",
+            _fmt(fut.get("mes_quote"), ".2f"),
+            delta=f"SPY-Eq Fwd: ${_fmt(fut.get('mes_scaled_fwd'), '.2f')} (Divisor: {_fmt(fut.get('spx_spy_ratio'), '.4f')})",
             delta_color="off",
             help=(
                 "**What it means:** Front-month Micro E-mini S&P 500 (`MESZ26.CME`) mid-quote and its SPY share-equivalent "
-                "forward price (`MES / 10`).\n\n"
+                "forward price (`MES / (SPX / SPY)`, ratio from time-aligned 1-minute index and ETF bars).\n\n"
                 "**What it informs:** Provides a direct, model-free forward benchmark unaffected by American option Early Exercise Premium."
             ),
         )
@@ -1020,7 +846,7 @@ def page_futures_basis() -> None:
         st.metric(
             "Parity Fwd vs Futures Fwd",
             f"${fut.get('parity_fwd', 0):.2f}" if fut.get("parity_fwd") else "N/A",
-            delta=f"Diff: ${fut.get('parity_vs_fut_diff_usd', 0):+.2f} ({fut.get('parity_vs_fut_diff_bps', 0):+.1f} bps)",
+            delta=f"Diff: ${_fmt(fut.get('parity_vs_fut_diff_usd'), '+.2f')} ({_fmt(fut.get('parity_vs_fut_diff_bps'), '+.1f')} bps)",
             delta_color="off",
             help=(
                 "**What it means:** Compares `FastVolActor`'s put-call parity forward ($F_{\\text{parity}}$) against the "
@@ -1031,8 +857,8 @@ def page_futures_basis() -> None:
     with c3:
         st.metric(
             "Futures-Implied Carry (q_fut)",
-            f"{fut.get('futures_implied_q', 0):.2%}",
-            delta=f"vs Parity q: {fut.get('parity_vs_fut_q_diff_bps', 0):+.1f} bps",
+            _fmt(fut.get("futures_implied_q"), ".2%"),
+            delta=f"vs Parity q: {_fmt(fut.get('parity_vs_fut_q_diff_bps'), '+.1f')} bps",
             delta_color="off",
             help=(
                 "**What it means:** Continuous dividend yield $q_{\\text{fut}} = r - \\frac{1}{T}\\ln(F_{\\text{fut}}/S)$ backed out "
@@ -1043,8 +869,8 @@ def page_futures_basis() -> None:
     with c4:
         st.metric(
             "Cash-Futures Basis",
-            f"${fut.get('cash_futures_basis_usd', 0):+.3f}",
-            delta=f"{fut.get('cash_futures_basis_pct', 0):+.3%} ({fut.get('mes_ttm_days', 0):.1f}d to expiry)",
+            f"${_fmt(fut.get('cash_futures_basis_usd'), '+.3f')}",
+            delta=f"{_fmt(fut.get('cash_futures_basis_pct'), '+.3%')} ({_fmt(fut.get('mes_ttm_days'), '.1f')}d to expiry)",
             delta_color="off",
             help=(
                 "**What it means:** Raw price spread between scaled `MES` futures and `SPY` spot ($F - S$).\n\n"
@@ -1056,7 +882,7 @@ def page_futures_basis() -> None:
         st.metric(
             "MNQ Futures / Hedge Ratio",
             f"{mnq:.2f}" if mnq else "N/A",
-            delta=f"1 MES ≈ {fut.get('mes_spy_equiv_shares', 50):.0f} SPY sh",
+            delta=f"1 MES ≈ {_fmt(fut.get('mes_spy_equiv_shares'), '.0f')} SPY sh",
             delta_color="off",
             help=(
                 "**What it means:** Front-month Micro E-mini Nasdaq-100 (`MNQZ26.CME`) quote and the SPY delta-equivalent "
@@ -1066,31 +892,8 @@ def page_futures_basis() -> None:
         )
 
     st.divider()
-    comp_rows = [
-        {
-            "Source": "FastVolActor (Option Put-Call Parity)",
-            "Horizon (Days)": surf.get("ttm_days"),
-            "Implied Forward ($)": fut.get("parity_fwd"),
-            "Implied Carry q (%)": round(float(surf.get("implied_q", 0)) * 100, 3),
-            "Notes": f"Estimated from {surf.get('parity_pairs', 0)} ATM SPY option pair(s)",
-        },
-        {
-            "Source": "FuturesContextActor (CME MESZ26.CME)",
-            "Horizon (Days)": fut.get("mes_ttm_days"),
-            "Implied Forward ($)": fut.get("mes_scaled_fwd"),
-            "Implied Carry q (%)": round(float(fut.get("futures_implied_q", 0)) * 100, 3),
-            "Notes": f"Model-free CME futures scaled by {fut.get('spx_spy_ratio', 10.0):.5f} ({fut.get('ratio_source', 'DEFAULT_10X')})",
-        },
-        {
-            "Source": "Futures-Implied Forward @ Option Expiry",
-            "Horizon (Days)": surf.get("ttm_days"),
-            "Implied Forward ($)": fut.get("fut_implied_opt_fwd"),
-            "Implied Carry q (%)": round(float(fut.get("futures_implied_q", 0)) * 100, 3),
-            "Notes": f"Parity vs. Futures Divergence = {fut.get('parity_vs_fut_diff_usd', 0):+.3f} ({fut.get('parity_vs_fut_diff_bps', 0):+.1f} bps)",
-        },
-    ]
     st.subheader("Side-by-Side Forward & Implied Dividend Yield Comparison")
-    st.dataframe(pd.DataFrame(comp_rows), hide_index=True, use_container_width=True)
+    st.dataframe(pd.DataFrame(forward_comparison_rows(fut, surf)), hide_index=True, use_container_width=True)
 
     with st.expander("Raw `mft:futures:latest` JSON Payload", expanded=False):
         st.json(fut)
@@ -1140,18 +943,7 @@ def page_risk_daemon() -> None:
 
     if risk_transitions:
         st.subheader("State Transition Audit Log (`mft:risk:transitions`)")
-        t_rows = [
-            {
-                "Timestamp (UTC)": t.get("evaluated_at_utc"),
-                "Event": t.get("event", "STATE_CHANGE"),
-                "Halted": t.get("to_halted", t.get("halted")),
-                "VIX Ratio": t.get("vix_ratio"),
-                "Regime Age (s)": t.get("regime_age_sec"),
-                "Reasons": ", ".join(t.get("reasons", [])) or "None (Healthy)",
-            }
-            for t in risk_transitions
-        ]
-        st.dataframe(pd.DataFrame(t_rows), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(risk_transition_rows(risk_transitions)), hide_index=True, use_container_width=True)
 
 
 
@@ -1187,7 +979,10 @@ def page_vrp_strategy() -> None:
             top.get("combo", "None"),
             delta=f"Mid: ${top.get('mid_credit', 0):.2f} vs Nat: ${top.get('nat_credit', 0):.2f}",
             delta_color="off",
-            help="Highest net-EV spread candidate scanned from the live SVI slice.",
+            help=(
+                "Best-ranked spread from the live SVI slice: gate-approved first, then expected $EV at the approved "
+                "size (tail-budget aware), then EV per $ of ES99."
+            ),
         )
     with c3:
         st.metric(
@@ -1223,6 +1018,18 @@ def page_vrp_strategy() -> None:
     if vrp.get("all_candidates"):
         st.subheader("Live Candidate Spread Ranking & Gate Audit")
         st.dataframe(pd.DataFrame(vrp["all_candidates"]), hide_index=True, use_container_width=True)
+
+    if vrp.get("working_orders"):
+        st.subheader("Working OptionSpread Orders (One Clip at a Time)")
+        st.dataframe(pd.DataFrame(vrp["working_orders"]), hide_index=True, use_container_width=True)
+
+    if vrp.get("open_book"):
+        st.subheader("Strategy Spread Book")
+        st.dataframe(pd.DataFrame(vrp["open_book"]), hide_index=True, use_container_width=True)
+
+    if vrp.get("exit_signals"):
+        st.subheader("Exit Signals (Profit Target / DTE Time Stop)")
+        st.dataframe(pd.DataFrame(vrp["exit_signals"]), hide_index=True, use_container_width=True)
 
     with st.expander("Raw `mft:strategy:vrp:latest` JSON Payload", expanded=False):
         st.json(vrp)
