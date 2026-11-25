@@ -42,9 +42,19 @@ def select_put_spread(day_df: pd.DataFrame, spot: float) -> tuple[pd.Series, pd.
     return short_candidates.iloc[-1], short_candidates.iloc[-3]
 
 
-def _quote_by_strike(day_df: pd.DataFrame, strike: float, right: str = "P") -> pd.Series | None:
-    """Return the option row for a given strike and right (C/P) on a given day, or None if missing."""
+def _quote_by_strike(
+    day_df: pd.DataFrame, strike: float, right: str = "P",
+    expiry: str | None = None,
+) -> pd.Series | None:
+    """Return the option row for a given strike and right (C/P) on a given day, or None if missing.
+
+    When ``expiry`` is provided and the DataFrame has an ``"expiry"`` column, the lookup
+    also filters by the exact expiry.  This enables multi-expiry backtesting where the
+    same strike may exist across multiple expirations.
+    """
     matches = day_df[(day_df["right"] == right) & (day_df["strike"] == strike)]
+    if expiry is not None and "expiry" in day_df.columns:
+        matches = matches[matches["expiry"] == expiry]
     if len(matches) == 0:
         return None
     return matches.iloc[0]
@@ -55,14 +65,19 @@ def compute_exit_debit(
     short_strike: float,
     long_strike: float,
     exit_slippage_frac: float,
+    expiry: str | None = None,
 ) -> tuple[float | None, bool]:
     """Exit debit per share to close a bull put spread using day-$t$ quotes.
+
+    When ``expiry`` is provided and the DataFrame has an ``"expiry"`` column, both leg
+    lookups are filtered by the exact expiry.  This ensures multi-expiry chains do not
+    cross-pollute quotes across expirations.
 
     Returns (exit_debit, is_fallback). When either strike lacks a quote on the exit date,
     ``is_fallback = True`` and the function returns ``None`` as the debit.
     """
-    short_row = _quote_by_strike(day_df, short_strike, right="P")
-    long_row = _quote_by_strike(day_df, long_strike, right="P")
+    short_row = _quote_by_strike(day_df, short_strike, right="P", expiry=expiry)
+    long_row = _quote_by_strike(day_df, long_strike, right="P", expiry=expiry)
     if short_row is not None and long_row is not None:
         short_mid = float(short_row["mid"])
         short_ask = float(short_row["ask"])
@@ -105,7 +120,8 @@ def bsm_fallback_exit_debit(
 
 
 def put_spread_combo(
-    symbol: str, spot: float, short: pd.Series, wing: pd.Series, mid_credit: float, width: float
+    symbol: str, spot: float, short: pd.Series, wing: pd.Series, mid_credit: float, width: float,
+    ttm_days: float = float(TARGET_DTE_DAYS),
 ) -> CandidateCombo:
     def leg(name: str, row: pd.Series, side: int) -> CandidateLeg:
         iv = float(row["iv"])
@@ -120,8 +136,8 @@ def put_spread_combo(
         strategy_type="BULL_PUT_SPREAD",
         underlying=symbol,
         spot=spot,
-        forward=spot * math.exp(ASSUMED_CARRY * days_to_years(TARGET_DTE_DAYS)),
-        ttm_days=float(TARGET_DTE_DAYS),
+        forward=spot * math.exp(ASSUMED_CARRY * days_to_years(ttm_days)),
+        ttm_days=float(ttm_days),
         risk_free_rate=DEFAULT_RISK_FREE_RATE,
         dividend_yield=ASSUMED_DIVIDEND_YIELD,
         legs=[leg("SP", short, -1), leg("LP", wing, +1)],
@@ -164,6 +180,54 @@ def _gate_parity_checks(
     return reasons
 
 
+def select_entry_slice(
+    day_df: pd.DataFrame,
+    as_of: date,
+    target_dte: int = TARGET_DTE_DAYS,
+    min_entry_dte: int = 21,
+    max_entry_dte: int = 45,
+) -> tuple[pd.DataFrame, date, str | None]:
+    """Select the expiry slice for entry on ``as_of``.
+
+    For backward compatibility, when ``"expiry"`` is not in ``day_df.columns`` the function
+    returns the whole DataFrame unchanged with a synthetic expiry date ``as_of + target_dte``
+    and ``None`` for the ISO string.
+
+    When multi-expiry data *is* present, it finds the expiry whose calendar DTE is in
+    ``[min_entry_dte, max_entry_dte]`` and closest to ``target_dte`` (tie-break: longer DTE).
+    If none qualifies, returns an empty DataFrame.
+
+    Returns
+    -------
+    (slice_df, chosen_date, chosen_iso)
+        - ``slice_df``: rows of ``day_df`` filtered to the chosen expiry (or all rows).
+        - ``chosen_date``: ``date`` of the expiry.
+        - ``chosen_iso``: ISO string of the expiry (``None`` for single-expiry data).
+    """
+    if "expiry" not in day_df.columns:
+        chosen_date = as_of + timedelta(days=target_dte)
+        return day_df, chosen_date, None
+
+    day_dtes: dict[str, int] = {}
+    for exp_str in day_df["expiry"].unique():
+        try:
+            exp_date = date.fromisoformat(exp_str)
+        except (ValueError, TypeError):
+            continue
+        day_dtes[exp_str] = (exp_date - as_of).days
+
+    # Filter by entry DTE range
+    eligible = {k: v for k, v in day_dtes.items() if min_entry_dte <= v <= max_entry_dte}
+    if not eligible:
+        return pd.DataFrame(columns=day_df.columns), as_of, None  # skip
+
+    # Choose expiry minimising |dte - target_dte|; tie-break: longer DTE
+    best_exp = min(eligible, key=lambda k: (abs(eligible[k] - target_dte), -eligible[k]))
+    chosen_date = date.fromisoformat(best_exp)
+    slice_df = day_df[day_df["expiry"] == best_exp].copy()
+    return slice_df, chosen_date, best_exp
+
+
 def run_midcap_vrp_backtest(
     df: pd.DataFrame,
     sleeve_equity_usd: float = 100_000.0,
@@ -182,14 +246,20 @@ def run_midcap_vrp_backtest(
     max_concurrent_trades: int = 1,
     max_leg_spread_pct: float = MAX_LEG_SPREAD_PCT,
     min_open_interest: int = MIN_OPEN_INTEREST,
+    use_delta_targeted: bool = False,
+    min_vrp: float = MIN_VRP,
+    min_tob_size: int = 4,
+    max_tob_participation: float = 0.25,
 ) -> dict[str, Any]:
-    """Walk-forward mid-cap VRP simulation with quote-marked exits and live-gate parity.
+    """Walk-forward mid-cap VRP simulation with quote-marked exits, live-gate parity,
+    multi-expiry entry selection, optional delta-targeted verticals, and TOB size parity.
 
     Parameters
     ----------
     df : pd.DataFrame
         One row per option per day: date (ISO), spot, rv_20d, atm_iv,
-        right, strike, bid, ask, mid, iv.  Optionally ``open_interest``.
+        right, strike, bid, ask, mid, iv.  Optionally ``open_interest``,
+        ``expiry`` (ISO), ``bid_size``, ``ask_size``.
     sleeve_equity_usd : float
         Starting equity.
     passive_touch_fill_prob : float
@@ -220,6 +290,15 @@ def run_midcap_vrp_backtest(
         Maximum allowed leg spread as fraction of mid.
     min_open_interest : int
         Minimum open interest to allow leg entry (applied when column present).
+    use_delta_targeted : bool
+        If True, use ``delta_targeted_verticals`` from ``src.scanner.verticals``
+        instead of adjacent-strike selection.  Requires ``expiry`` and ``iv`` columns.
+    min_vrp : float
+        Minimum VRP (atm_iv - rv_20d) to attempt an entry.
+    min_tob_size : int
+        Minimum bid/ask size required on each leg when ``bid_size``/``ask_size`` columns exist.
+    max_tob_participation : float
+        Caps lots to a fraction of the minimum TOB size among the two legs.
 
     Returns
     -------
@@ -257,10 +336,14 @@ def run_midcap_vrp_backtest(
         for t in open_trades:
             short_strike = t["short_strike"]
             long_strike = t["long_strike"]
-            exit_debit, is_fallback = compute_exit_debit(day_df, short_strike, long_strike, exit_slippage_frac)
+            expiry_str = t.get("expiry")  # None for single-expiry chains
+            exit_debit, is_fallback = compute_exit_debit(
+                day_df, short_strike, long_strike, exit_slippage_frac, expiry=expiry_str,
+            )
             if is_fallback:
                 days_held = (as_of - t["entry_date"]).days
-                ttm_remaining = max(TARGET_DTE_DAYS - days_held, 1.0)
+                expiry_date = t["expiry_date"]
+                ttm_remaining = max((expiry_date - as_of).days, 1.0)
                 bsm_debit, net_mid = bsm_fallback_exit_debit(
                     short_strike, long_strike, spot, atm_iv,
                     ttm_remaining, exit_slippage_frac,
@@ -275,10 +358,9 @@ def run_midcap_vrp_backtest(
 
             # 50% profit-target early exit
             if exit_debit <= entry_fill * (1.0 - profit_target_fraction):
-                exit_mid = 0.0
                 if not is_fallback:
-                    srow = _quote_by_strike(day_df, short_strike, right="P")
-                    lrow = _quote_by_strike(day_df, long_strike, right="P")
+                    srow = _quote_by_strike(day_df, short_strike, right="P", expiry=expiry_str)
+                    lrow = _quote_by_strike(day_df, long_strike, right="P", expiry=expiry_str)
                     if srow is not None and lrow is not None:
                         exit_mid = max(float(srow["mid"]) - float(lrow["mid"]), 0.0)
                 exit_slippage = max(0.0, exit_debit - exit_mid)
@@ -298,10 +380,9 @@ def run_midcap_vrp_backtest(
             dte = (expiry_date - as_of).days
             days_held = (as_of - t["entry_date"]).days
             if dte <= min_exit_dte or days_held >= max_holding_days:
-                exit_mid = 0.0
                 if not is_fallback:
-                    srow = _quote_by_strike(day_df, short_strike, right="P")
-                    lrow = _quote_by_strike(day_df, long_strike, right="P")
+                    srow = _quote_by_strike(day_df, short_strike, right="P", expiry=expiry_str)
+                    lrow = _quote_by_strike(day_df, long_strike, right="P", expiry=expiry_str)
                     if srow is not None and lrow is not None:
                         exit_mid = max(float(srow["mid"]) - float(lrow["mid"]), 0.0)
                 exit_slippage = max(0.0, exit_debit - exit_mid)
@@ -324,35 +405,134 @@ def run_midcap_vrp_backtest(
         if len(open_trades) >= max_concurrent_trades:
             continue
 
-        ev_chk = calendar.check_entry(symbol, as_of=as_of, expiry_date=as_of + timedelta(days=TARGET_DTE_DAYS))
-        if vrp < MIN_VRP or not ev_chk.allowed:
-            continue
-
-        pair = select_put_spread(day_df, spot)
-        if pair is None:
-            continue
-        short, wing = pair
-        width = float(short["strike"] - wing["strike"])
-        mid_credit = float(short["mid"] - wing["mid"])
-        nat_credit = float(short["bid"] - wing["ask"])
-
-        gate_reasons = _gate_parity_checks(
-            day_df, short, wing, mid_credit, nat_credit,
-            max_leg_spread_pct=max_leg_spread_pct, min_open_interest=min_open_interest,
+        # -- Multi-expiry entry selection --
+        entry_slice, chosen_expiry_date, chosen_expiry_iso = select_entry_slice(
+            day_df, as_of, target_dte=TARGET_DTE_DAYS,
         )
-        if gate_reasons:
-            gate_rejects += 1
+        if entry_slice.empty:
             continue
 
-        combo = put_spread_combo(symbol, spot, short, wing, mid_credit, width)
-        risk = pricer.evaluate_combo(
-            combo, realized_vol_p=rv_20d, horizon_days=float(max_holding_days), sleeve_equity_usd=equity
-        )
-        if not risk.approved:
+        entry_ttm_days = float((chosen_expiry_date - as_of).days)
+
+        ev_chk = calendar.check_entry(symbol, as_of=as_of, expiry_date=chosen_expiry_date)
+        if vrp < min_vrp or not ev_chk.allowed:
             continue
+
+        if use_delta_targeted:
+            # -- Delta-targeted mode --
+            from src.scanner.verticals import delta_targeted_verticals
+
+            puts = entry_slice[entry_slice["right"] == "P"].sort_values("strike")
+            puts_dicts = []
+            for _, row in puts.iterrows():
+                d = dict(row)
+                d.setdefault("raw_iv", float(row.get("iv", 0.35)))
+                d.setdefault("svi_iv", float(row.get("iv", 0.35)))
+                d.setdefault("vega", 0.5)
+                d.setdefault("edge_to_half_spread", 0.0)
+                d.setdefault("open_interest", 0)
+                puts_dicts.append(d)
+
+            pairs = delta_targeted_verticals(
+                puts_dicts, [],
+                spot=spot,
+                short_delta_range=(0.15, 0.30),
+                min_width_usd=2.50,
+                min_width_pct_spot=0.04,
+                max_width_pct_spot=0.12,
+                min_mid_credit=MIN_MID_CREDIT,
+                ttm_days=entry_ttm_days,
+            )
+            if not pairs:
+                continue
+
+            best_pair = None
+            best_risk = None
+            best_lots = 0
+            for pair in pairs:
+                short_row = _quote_by_strike(entry_slice, pair.short["strike"], right="P", expiry=chosen_expiry_iso)
+                wing_row = _quote_by_strike(entry_slice, pair.long["strike"], right="P", expiry=chosen_expiry_iso)
+                if short_row is None or wing_row is None:
+                    continue
+                width = pair.width
+                mid_credit = pair.mid_credit
+                nat_credit = pair.nat_credit
+                if "bid_size" in entry_slice.columns:
+                    sb = int(short_row.get("bid_size", 0))
+                    wa = int(wing_row.get("ask_size", 0))
+                    if sb < min_tob_size or wa < min_tob_size:
+                        continue
+                gate_reasons = _gate_parity_checks(
+                    entry_slice, short_row, wing_row, mid_credit, nat_credit,
+                    max_leg_spread_pct=max_leg_spread_pct, min_open_interest=min_open_interest,
+                )
+                if gate_reasons:
+                    gate_rejects += 1
+                    continue
+                combo = put_spread_combo(symbol, spot, short_row, wing_row, mid_credit, width, ttm_days=entry_ttm_days)
+                risk = pricer.evaluate_combo(
+                    combo, realized_vol_p=rv_20d, horizon_days=float(max_holding_days),
+                    sleeve_equity_usd=equity,
+                )
+                if not risk.approved:
+                    continue
+                if best_pair is None or risk.net_ev_usd > best_risk.net_ev_usd:
+                    best_pair = (short_row, wing_row, width, mid_credit, nat_credit, combo)
+                    best_risk = risk
+                    best_lots = risk.recommended_contracts
+
+            if best_pair is None:
+                continue
+            short, wing, width, mid_credit, nat_credit, combo = best_pair
+            risk = best_risk
+            lots = best_lots
+
+        else:
+            pair = select_put_spread(entry_slice, spot)
+            if pair is None:
+                continue
+            short, wing = pair
+            width = float(short["strike"] - wing["strike"])
+            mid_credit = float(short["mid"] - wing["mid"])
+            nat_credit = float(short["bid"] - wing["ask"])
+            if "bid_size" in entry_slice.columns:
+                sb = int(short.get("bid_size", 0))
+                wa = int(wing.get("ask_size", 0))
+                if sb < min_tob_size or wa < min_tob_size:
+                    gate_rejects += 1
+                    continue
+            gate_reasons = _gate_parity_checks(
+                entry_slice, short, wing, mid_credit, nat_credit,
+                max_leg_spread_pct=max_leg_spread_pct, min_open_interest=min_open_interest,
+            )
+            if gate_reasons:
+                gate_rejects += 1
+                continue
+            combo = put_spread_combo(symbol, spot, short, wing, mid_credit, width, ttm_days=entry_ttm_days)
+            risk = pricer.evaluate_combo(
+                combo, realized_vol_p=rv_20d, horizon_days=float(max_holding_days),
+                sleeve_equity_usd=equity,
+            )
+            if not risk.approved:
+                continue
+            lot_cap = 999_999
+            if "bid_size" in entry_slice.columns:
+                sb = int(short.get("bid_size", 0))
+                wa = int(wing.get("ask_size", 0))
+                lot_cap = min(sb, wa)
+            lots = min(risk.recommended_contracts, lot_cap)
+
+        # TOB participation cap
+        if "bid_size" in entry_slice.columns:
+            sb = int(short.get("bid_size", 0))
+            wa = int(wing.get("ask_size", 0))
+            capped = min(lots, int(sb * max_tob_participation), int(wa * max_tob_participation))
+            if capped < 1:
+                continue
+            lots = capped
 
         clips = executor.create_parent_plan(
-            symbol, combo.name, CREDIT_OPEN, risk.recommended_contracts, spot, mid_credit, nat_credit,
+            symbol, combo.name, CREDIT_OPEN, lots, spot, mid_credit, nat_credit,
             register=False
         )
         if rng.random() > passive_touch_fill_prob:
@@ -360,13 +540,13 @@ def run_midcap_vrp_backtest(
             continue
 
         entry_fill = float(clips[0].current_limit_price)
-        lots = risk.recommended_contracts
         open_trades.append({
             "entry_date": as_of, "entry_fill": entry_fill, "lots": lots,
             "short_strike": float(short["strike"]),
             "long_strike": float(wing["strike"]),
             "width": width,
-            "expiry_date": as_of + timedelta(days=TARGET_DTE_DAYS),
+            "expiry_date": chosen_expiry_date,
+            "expiry": chosen_expiry_iso,
             "entry_credit": mid_credit,
         })
 # --- Force-close trades still open at simulation end --------------------------------------------
@@ -374,14 +554,17 @@ def run_midcap_vrp_backtest(
         last_group = grouped[-1]
         last_df = last_group[1]
         for t in open_trades:
-            # Try quote-based exit first
-            exit_debit, is_fallback = compute_exit_debit(last_df, t["short_strike"], t["long_strike"], exit_slippage_frac)
+            expiry_str = t.get("expiry")
+            exit_debit, is_fallback = compute_exit_debit(
+                last_df, t["short_strike"], t["long_strike"], exit_slippage_frac, expiry=expiry_str,
+            )
             days_held = (grouped_dates[-1] - t["entry_date"]).days
             exit_mid = 0.0
             if is_fallback:
                 last_spot = float(last_df["spot"].iloc[0])
                 last_iv = float(last_df["atm_iv"].iloc[0])
-                ttm_remaining = max(TARGET_DTE_DAYS - days_held, 1.0)
+                expiry_date = t["expiry_date"]
+                ttm_remaining = max((expiry_date - grouped_dates[-1]).days, 1.0)
                 bsm_debit, net_mid = bsm_fallback_exit_debit(
                     t["short_strike"], t["long_strike"], last_spot, last_iv,
                     ttm_remaining, exit_slippage_frac,
@@ -390,8 +573,8 @@ def run_midcap_vrp_backtest(
                 exit_mid = max(net_mid, 0.0)
                 fallback_exit_marks += 1
             else:
-                srow = _quote_by_strike(last_df, t["short_strike"], right="P")
-                lrow = _quote_by_strike(last_df, t["long_strike"], right="P")
+                srow = _quote_by_strike(last_df, t["short_strike"], right="P", expiry=expiry_str)
+                lrow = _quote_by_strike(last_df, t["long_strike"], right="P", expiry=expiry_str)
                 if srow is not None and lrow is not None:
                     exit_mid = max(float(srow["mid"]) - float(lrow["mid"]), 0.0)
             exit_slippage = max(0.0, exit_debit - exit_mid)
