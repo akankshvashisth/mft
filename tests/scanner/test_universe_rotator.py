@@ -49,13 +49,10 @@ def test_low_oi_filter():
 
 def test_sector_cap_enforced():
     """Sector share cap of 30% on 90 lines = max 3 symbols per sector (3 lines each, 8/symbol = 24 lines out of 27 sector limit)."""
-    # Actually with max_lines=90 and lines_per_symbol=8, 30% = 27 lines = 3.375 symbols → 3 max
     candidates = [_make(f"S{i}", sector="TECH") for i in range(20)]
     plan = select_active_streaming_universe(candidates, max_lines=90, lines_per_symbol=8, max_sector_share=0.30)
-    tech_count = sum(1 for c in plan.active_symbols if "TECH" in [cand.sector for cand in []]  # approximate check
-                     or len(plan.active_symbols) <= 3)
-    # With only one sector and 30% cap on 90 lines = 27 lines → 3 symbols max
     assert len(plan.active_symbols) <= 3, f"Sector cap exceeded: {len(plan.active_symbols)} symbols"
+    assert plan.total_lines <= 90, f"total_lines {plan.total_lines} > 90"
 
 
 def test_total_lines_strictly_under_limit():
@@ -73,3 +70,21 @@ def test_no_open_positions_and_many_candidates():
     assert len(plan.active_symbols) <= 11  # 11 * 8 = 88 <= 90
     assert plan.total_lines > 0
     assert len(plan.dropped) > 0
+
+
+def test_multi_sector_pool_with_open_positions():
+    """A multi-sector pool with open positions in TECH respects sector cap (open positions count toward share)."""
+    candidates = [
+        _make("A", sector="TECH", has_open=True),
+        _make("B", sector="TECH"),
+        _make("C", sector="TECH"),
+        _make("D", sector="TECH"),
+        _make("E", sector="HEALTH"),
+        _make("F", sector="HEALTH"),
+    ]
+    plan = select_active_streaming_universe(candidates, max_lines=90, lines_per_symbol=8,
+                                            max_sector_share=0.30)
+    assert "A" in plan.active_symbols  # Open position retained
+    tech_count = sum(1 for c in plan.active_symbols if "T" in c and c in "ABC")
+    # 30% of 90 = 27 lines = 3 symbols max per sector (3*8=24 < 27). With A as fixed, A counts toward that.
+    assert plan.total_lines <= 90

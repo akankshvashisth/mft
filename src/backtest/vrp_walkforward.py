@@ -84,8 +84,11 @@ def bsm_fallback_exit_debit(
     exit_slippage_frac: float,
     risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
     dividend_yield: float = ASSUMED_DIVIDEND_YIELD,
-) -> float:
-    """BSM-repriced exit debit when one or both strikes have no quote on the exit date."""
+) -> tuple[float, float]:
+    """BSM-repriced exit debit when one or both strikes have no quote on the exit date.
+
+    Returns (exit_debit, net_mid) where net_mid = short_bsm - long_bsm.
+    """
     try:
         from src.quant.black_scholes import bsm_prices as price_fn
     except ImportError:
@@ -98,7 +101,7 @@ def bsm_fallback_exit_debit(
     short_spread = max(0.05, 0.10 * abs(short_bsm))
     long_spread = max(0.05, 0.10 * abs(long_bsm))
     penalty = exit_slippage_frac * (short_spread + long_spread) / 2.0
-    return max(net_mid + penalty, 0.0)
+    return max(net_mid + penalty, 0.0), net_mid
 
 
 def put_spread_combo(
@@ -258,20 +261,32 @@ def run_midcap_vrp_backtest(
             if is_fallback:
                 days_held = (as_of - t["entry_date"]).days
                 ttm_remaining = max(TARGET_DTE_DAYS - days_held, 1.0)
-                exit_debit = bsm_fallback_exit_debit(
+                bsm_debit, net_mid = bsm_fallback_exit_debit(
                     short_strike, long_strike, spot, atm_iv,
                     ttm_remaining, exit_slippage_frac,
                 )
+                exit_debit = bsm_debit
+                exit_mid = max(net_mid, 0.0)
                 fallback_exit_marks += 1
+            else:
+                exit_mid = 0.0
             entry_fill = t["entry_fill"]
             lots = t["lots"]
 
             # 50% profit-target early exit
             if exit_debit <= entry_fill * (1.0 - profit_target_fraction):
+                exit_mid = 0.0
+                if not is_fallback:
+                    srow = _quote_by_strike(day_df, short_strike, right="P")
+                    lrow = _quote_by_strike(day_df, long_strike, right="P")
+                    if srow is not None and lrow is not None:
+                        exit_mid = max(float(srow["mid"]) - float(lrow["mid"]), 0.0)
+                exit_slippage = max(0.0, exit_debit - exit_mid)
                 pnl = (entry_fill - exit_debit) * 100.0 * lots - commission_per_lot * lots
                 t.update(pnl_usd=round(pnl, 2), exit_reason=PROFIT_TARGET,
                          exit_debit=exit_debit, exit_date=as_of,
-                         holding_calendar_days=(as_of - t["entry_date"]).days)
+                         holding_calendar_days=(as_of - t["entry_date"]).days,
+                         exit_slippage=round(exit_slippage, 4))
                 trades.append(t)
                 equity += pnl
                 equity_curve.append(equity)
@@ -283,10 +298,18 @@ def run_midcap_vrp_backtest(
             dte = (expiry_date - as_of).days
             days_held = (as_of - t["entry_date"]).days
             if dte <= min_exit_dte or days_held >= max_holding_days:
+                exit_mid = 0.0
+                if not is_fallback:
+                    srow = _quote_by_strike(day_df, short_strike, right="P")
+                    lrow = _quote_by_strike(day_df, long_strike, right="P")
+                    if srow is not None and lrow is not None:
+                        exit_mid = max(float(srow["mid"]) - float(lrow["mid"]), 0.0)
+                exit_slippage = max(0.0, exit_debit - exit_mid)
                 pnl = (entry_fill - exit_debit) * 100.0 * lots - commission_per_lot * lots
                 t.update(pnl_usd=round(pnl, 2), exit_reason=TIME_STOP,
                          exit_debit=exit_debit, exit_date=as_of,
-                         holding_calendar_days=days_held)
+                         holding_calendar_days=days_held,
+                         exit_slippage=round(exit_slippage, 4))
                 trades.append(t)
                 equity += pnl
                 equity_curve.append(equity)
@@ -354,24 +377,34 @@ def run_midcap_vrp_backtest(
             # Try quote-based exit first
             exit_debit, is_fallback = compute_exit_debit(last_df, t["short_strike"], t["long_strike"], exit_slippage_frac)
             days_held = (grouped_dates[-1] - t["entry_date"]).days
+            exit_mid = 0.0
             if is_fallback:
                 last_spot = float(last_df["spot"].iloc[0])
                 last_iv = float(last_df["atm_iv"].iloc[0])
                 ttm_remaining = max(TARGET_DTE_DAYS - days_held, 1.0)
-                exit_debit = bsm_fallback_exit_debit(
+                bsm_debit, net_mid = bsm_fallback_exit_debit(
                     t["short_strike"], t["long_strike"], last_spot, last_iv,
                     ttm_remaining, exit_slippage_frac,
                 )
+                exit_debit = bsm_debit
+                exit_mid = max(net_mid, 0.0)
                 fallback_exit_marks += 1
+            else:
+                srow = _quote_by_strike(last_df, t["short_strike"], right="P")
+                lrow = _quote_by_strike(last_df, t["long_strike"], right="P")
+                if srow is not None and lrow is not None:
+                    exit_mid = max(float(srow["mid"]) - float(lrow["mid"]), 0.0)
+            exit_slippage = max(0.0, exit_debit - exit_mid)
             pnl = (t["entry_fill"] - exit_debit) * 100.0 * t["lots"] - commission_per_lot * t["lots"]
-        trades.append({
-            **t, "pnl_usd": round(pnl, 2), "exit_reason": TIME_STOP,
-            "exit_debit": exit_debit, "exit_date": grouped_dates[-1],
-            "holding_calendar_days": days_held,
-        })
-        equity += pnl
-        equity_curve.append(equity)
-        exits_by_reason[TIME_STOP] += 1
+            trades.append({
+                **t, "pnl_usd": round(pnl, 2), "exit_reason": TIME_STOP,
+                "exit_debit": exit_debit, "exit_date": grouped_dates[-1],
+                "holding_calendar_days": days_held,
+                "exit_slippage": round(exit_slippage, 4),
+            })
+            equity += pnl
+            equity_curve.append(equity)
+            exits_by_reason[TIME_STOP] += 1
 # --- Compute summary --------------------------------------------------------------------------
     curve = np.asarray(equity_curve, dtype=float)
     max_dd_pct = float(np.min(curve / np.maximum.accumulate(curve) - 1.0)) if len(curve) > 0 else 0.0
@@ -380,16 +413,12 @@ def run_midcap_vrp_backtest(
 
     total_return = equity - sleeve_equity_usd
     total_friction_usd = commission_per_lot * float(np.sum([t["lots"] for t in trades])) if trades else 0.0
-    # Entry + exit spread slippage: credit given up by stepping inside from mid on entry,
+    # Entry + exit spread slippage: credit given up stepping inside from mid on entry,
     # plus extra debit paid by not closing at mid on exit.
     for t in trades:
-        entry_credit = t.get("entry_credit", 0.0)
-        entry_fill = t.get("entry_fill", 0.0)
-        exit_debit = t.get("exit_debit", 0.0)
-        entry_spread = max(0.0, entry_credit - entry_fill)
-        exit_spread = max(0.0, exit_debit - entry_credit)  # Approximates exit_mid erosion
-        # Use close_mid estimate from entry_credit for round-trip
-        total_friction_usd += (entry_spread + exit_spread) * 100.0 * t["lots"]
+        entry_spread = max(0.0, t.get("entry_credit", 0.0) - t.get("entry_fill", 0.0))
+        exit_slip = t.get("exit_slippage", 0.0)
+        total_friction_usd += (entry_spread + exit_slip) * 100.0 * t["lots"]
     avg_hold = float(np.mean([t.get("holding_calendar_days", 0) for t in trades])) if trades else 0.0
 
     if n >= 2 and float(np.std(pnls)) > 0:

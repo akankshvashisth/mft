@@ -159,6 +159,9 @@ def test_yaml_event_provider_earnings(calendar):
 
     provider = YamlEventProvider(calendar)
     assert "2026-12-01" in [d.isoformat() for d in provider.earnings_dates("XBI.ARCA")]
+    divs = provider.ex_dividends("SPY.ARCA")
+    assert len(divs) == 1 and divs[0].amount == 1.78
+    assert provider.htb_borrow_rate("SPY.ARCA") == 0.0
 
 
 def test_cached_event_provider_earnings_and_dividends():
@@ -214,3 +217,8 @@ def test_cached_provider_update_symbol_merges():
     provider = CachedEventProvider()
     provider.update_symbol("NEW.ARCA", {"earnings": ["2026-12-15"], "ex_dividends": [], "htb_fee_annual": 0.0})
     assert provider.earnings_dates("NEW.ARCA") == (date(2026, 12, 15),)
+
+    # Updating only htb_fee_annual should preserve previously stored earnings
+    provider.update_symbol("NEW.ARCA", {"htb_fee_annual": 0.12})
+    assert provider.earnings_dates("NEW.ARCA") == (date(2026, 12, 15),), "earnings were overwritten"
+    assert provider.htb_borrow_rate("NEW.ARCA") == 0.12

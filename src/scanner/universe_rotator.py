@@ -69,10 +69,10 @@ def select_active_streaming_universe(
     # 1. Always keep open positions
     fixed: list[UniverseCandidate] = [c for c in candidates if c.has_open_position]
     plan.fixed_symbols = [c.symbol for c in fixed]
-    remaining_budget = max_lines - len(fixed) * lines_per_symbol
+    remaining_budget = max_lines - fixed_lines - len(fixed) * lines_per_symbol
     if remaining_budget <= 0:
         plan.active_symbols = plan.fixed_symbols
-        plan.total_lines = len(plan.fixed_symbols) * lines_per_symbol
+        plan.total_lines = fixed_lines + len(plan.fixed_symbols) * lines_per_symbol
         plan.dropped = [c.symbol for c in candidates if not c.has_open_position]
         return plan
 
@@ -89,7 +89,11 @@ def select_active_streaming_universe(
 
     # 3. Rank by composite score, enforce sector cap
     ranked = sorted(filtered, key=_composite_score, reverse=True)
+    # Pre-seed sector counts from open positions so open positions count toward max_sector_share
     sector_counts: dict[str, int] = {}
+    for c in fixed:
+        if c.sector:
+            sector_counts[c.sector] = sector_counts.get(c.sector, 0) + 1
     selected: list[UniverseCandidate] = []
     for cand in ranked:
         lines_needed = lines_per_symbol if cand.symbol not in plan.fixed_symbols else 0
@@ -114,5 +118,5 @@ def select_active_streaming_universe(
     plan.dropped.extend(sector_budget_dropped)
 
     plan.active_symbols = plan.fixed_symbols + [c.symbol for c in selected]
-    plan.total_lines = len(plan.active_symbols) * lines_per_symbol
+    plan.total_lines = fixed_lines + len(plan.active_symbols) * lines_per_symbol
     return plan

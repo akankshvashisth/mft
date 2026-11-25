@@ -257,6 +257,26 @@ def test_force_close_with_live_quotes_on_short_chain():
     assert summary["fallback_exit_marks"] == 0
     assert summary["avg_holding_calendar_days"] == pytest.approx(4.0, abs=0.5)
 
+
+def test_force_close_multiple_open_trades():
+    """max_concurrent_trades=2 enters 2 trades on days 0 and 1; force-close at end closes both via quotes."""
+    quotes = {80.0: (0.48, 0.52), 85.0: (0.95, 1.05), 90.0: (1.90, 2.10)}
+    rows = []
+    for d in range(5):
+        for strike, (bid, ask) in sorted(quotes.items()):
+            rows.append({
+                "date": (START + timedelta(days=d)).isoformat(),
+                "spot": 100.0, "rv_20d": 0.15, "atm_iv": 0.20,
+                "right": "P", "strike": strike, "bid": bid, "ask": ask,
+                "mid": round(0.5 * (bid + ask), 4), "iv": 0.2,
+            })
+    df = pd.DataFrame(rows)
+    pricer = FakePricer(lambda combo: risk_assessment(recommended_contracts=1, approved=True))
+    summary = run(df, pricer=pricer, max_concurrent_trades=2)
+    assert summary["completed_trades"] == 2, f"Expected 2 force-closed trades, got {summary['completed_trades']}"
+    assert summary["fallback_exit_marks"] == 0
+    assert summary["avg_holding_calendar_days"] == pytest.approx(3.5, abs=1.5)
+
 def test_gate_parity_checks():
     """_gate_parity_checks returns reason codes when conditions are violated."""
     day_df = chain(days=1)

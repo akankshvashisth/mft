@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from src.common.market import symbol_of
 
@@ -183,7 +183,8 @@ class EventCalendar:
 # ── CorporateEventProvider protocol and implementations ─────────────────────────────────────
 
 
-class CorporateEventProvider:
+@runtime_checkable
+class CorporateEventProvider(Protocol):
     """Protocol for fetching corporate event data by symbol.
 
     Implementations provide earnings dates, ex-dividend info and HTB borrow rates.
@@ -247,8 +248,13 @@ class CachedEventProvider(CorporateEventProvider):
         return float(entry.get("htb_fee_annual", 0.0) or 0.0)
 
     def update_symbol(self, symbol: str, data: dict[str, Any]) -> None:
-        """Merge new data for ``symbol`` (e.g. from a ThetaData webhook or IBKR snapshot)."""
-        self._data[symbol] = data
+        """Merge new data for ``symbol`` (e.g. from a ThetaData webhook or IBKR snapshot).
+
+        Overwrites only the keys present in ``data``; preserves any existing keys not mentioned.
+        """
+        existing = dict(self._data.get(symbol, {}))
+        existing.update(data)
+        self._data[symbol] = existing
 
 
 def htb_blocks_entry(
