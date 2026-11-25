@@ -21,6 +21,7 @@ CANONICAL_COLUMNS = [
     "right", "strike", "bid", "ask", "mid", "bid_size", "ask_size", "iv",
 ]
 
+
 def parse_opra_definitions(def_df: pd.DataFrame) -> pd.DataFrame:
     """Extract and normalise Databento OPRA.PILLAR definition rows."""
     if def_df.empty:
@@ -50,7 +51,9 @@ def parse_opra_definitions(def_df: pd.DataFrame) -> pd.DataFrame:
         "unit_of_measure_qty" if "unit_of_measure_qty" in df.columns else None
     )
     if mult_col is not None:
-        df["multiplier"] = pd.to_numeric(df[mult_col], errors="coerce").fillna(100).astype(int)
+        raw_mult = pd.to_numeric(df[mult_col], errors="coerce").fillna(100).astype("int64")
+        # Databento OPRA.PILLAR uses INT32_MAX (2147483647) or 0 as sentinel for standard 100-share contracts
+        df["multiplier"] = raw_mult.replace({2147483647: 100, 0: 100}).astype(int)
     else:
         df["multiplier"] = 100
 
@@ -97,6 +100,7 @@ def extract_daily_nbbo_snapshot(
             columns=["date", "instrument_id", "bid", "ask", "mid", "bid_size", "ask_size"]
         )
 
+    # Reset index immediately so concatenated daily frames never trigger duplicate-label reindex errors
     df = cbbo_df.copy()
     ts_col = None
     for col in ("ts_recv", "ts_event"):
@@ -111,16 +115,22 @@ def extract_daily_nbbo_snapshot(
             return pd.DataFrame(
                 columns=["date", "instrument_id", "bid", "ask", "mid", "bid_size", "ask_size"]
             )
+    else:
+        df = df.reset_index(drop=True)
 
     ny_time = _to_ny_time(df[ts_col])
-    df["ny_time"] = ny_time
+    df["_ny_time"] = ny_time
     df["date"] = ny_time.dt.strftime("%Y-%m-%d")
 
     # Filter using total seconds so 15:45:30 is strictly excluded (even if valid)
     snap_deadline_secs = snap_hour_et * 3600 + snap_minute_et * 60
     snap_start_secs = snap_deadline_secs - window_minutes * 60
     df["_total_secs"] = ny_time.dt.hour * 3600 + ny_time.dt.minute * 60 + ny_time.dt.second
-    in_window = (df["_total_secs"] >= snap_start_secs) & (df["_total_secs"] <= snap_deadline_secs)
+    in_window = (
+        df["_ny_time"].notna()
+        & (df["_total_secs"] >= snap_start_secs)
+        & (df["_total_secs"] <= snap_deadline_secs)
+    )
     df = df.loc[in_window].copy()
     if df.empty:
         return pd.DataFrame(
@@ -135,17 +145,19 @@ def extract_daily_nbbo_snapshot(
     df["bid_val"] = pd.to_numeric(df[bid_col], errors="coerce")
     df["ask_val"] = pd.to_numeric(df[ask_col], errors="coerce")
 
-    valid = (df["bid_val"] > 0.0) & (df["ask_val"] >= df["bid_val"]) & np.isfinite(df["bid_val"]) & np.isfinite(df["ask_val"])
-    df = df.loc[valid].copy()
+    valid = (
+        (df["bid_val"] > 0.0)
+        & (df["ask_val"] >= df["bid_val"])
+        & np.isfinite(df["bid_val"])
+        & np.isfinite(df["ask_val"])
+    )
+    df = df.loc[valid].sort_values("_ny_time").reset_index(drop=True)
     if df.empty:
         return pd.DataFrame(
             columns=["date", "instrument_id", "bid", "ask", "mid", "bid_size", "ask_size"]
         )
 
-    df["_sort_key"] = ny_time.loc[df.index]
-    df = df.sort_values("_sort_key")
-
-    # Take last observation per (date, instrument_id)
+    # Take last valid intraday observation per (date, instrument_id) at or before snap_time
     last = df.groupby(["date", "instrument_id"], as_index=False).last()
 
     result = pd.DataFrame()
