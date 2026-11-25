@@ -120,7 +120,8 @@ def bsm_fallback_exit_debit(
 
 
 def put_spread_combo(
-    symbol: str, spot: float, short: pd.Series, wing: pd.Series, mid_credit: float, width: float
+    symbol: str, spot: float, short: pd.Series, wing: pd.Series, mid_credit: float, width: float,
+    ttm_days: float = float(TARGET_DTE_DAYS),
 ) -> CandidateCombo:
     def leg(name: str, row: pd.Series, side: int) -> CandidateLeg:
         iv = float(row["iv"])
@@ -135,8 +136,8 @@ def put_spread_combo(
         strategy_type="BULL_PUT_SPREAD",
         underlying=symbol,
         spot=spot,
-        forward=spot * math.exp(ASSUMED_CARRY * days_to_years(TARGET_DTE_DAYS)),
-        ttm_days=float(TARGET_DTE_DAYS),
+        forward=spot * math.exp(ASSUMED_CARRY * days_to_years(ttm_days)),
+        ttm_days=float(ttm_days),
         risk_free_rate=DEFAULT_RISK_FREE_RATE,
         dividend_yield=ASSUMED_DIVIDEND_YIELD,
         legs=[leg("SP", short, -1), leg("LP", wing, +1)],
@@ -417,7 +418,7 @@ def run_midcap_vrp_backtest(
         if vrp < min_vrp or not ev_chk.allowed:
             continue
 
-        if use_delta_targeted and chosen_expiry_iso is not None:
+        if use_delta_targeted:
             # -- Delta-targeted mode --
             from src.scanner.verticals import delta_targeted_verticals
 
@@ -449,8 +450,10 @@ def run_midcap_vrp_backtest(
             best_risk = None
             best_lots = 0
             for pair in pairs:
-                short_row = entry_slice[entry_slice["strike"] == pair.short["strike"]].iloc[0]
-                wing_row = entry_slice[entry_slice["strike"] == pair.long["strike"]].iloc[0]
+                short_row = _quote_by_strike(entry_slice, pair.short["strike"], right="P", expiry=chosen_expiry_iso)
+                wing_row = _quote_by_strike(entry_slice, pair.long["strike"], right="P", expiry=chosen_expiry_iso)
+                if short_row is None or wing_row is None:
+                    continue
                 width = pair.width
                 mid_credit = pair.mid_credit
                 nat_credit = pair.nat_credit
@@ -466,7 +469,7 @@ def run_midcap_vrp_backtest(
                 if gate_reasons:
                     gate_rejects += 1
                     continue
-                combo = put_spread_combo(symbol, spot, short_row, wing_row, mid_credit, width)
+                combo = put_spread_combo(symbol, spot, short_row, wing_row, mid_credit, width, ttm_days=entry_ttm_days)
                 risk = pricer.evaluate_combo(
                     combo, realized_vol_p=rv_20d, horizon_days=float(max_holding_days),
                     sleeve_equity_usd=equity,
@@ -505,7 +508,7 @@ def run_midcap_vrp_backtest(
             if gate_reasons:
                 gate_rejects += 1
                 continue
-            combo = put_spread_combo(symbol, spot, short, wing, mid_credit, width)
+            combo = put_spread_combo(symbol, spot, short, wing, mid_credit, width, ttm_days=entry_ttm_days)
             risk = pricer.evaluate_combo(
                 combo, realized_vol_p=rv_20d, horizon_days=float(max_holding_days),
                 sleeve_equity_usd=equity,

@@ -174,3 +174,57 @@ class TestBuildOpraBacktestChain:
             a = tuple(chain.iloc[i][c] for c in ("date", "expiry", "right", "strike"))
             b = tuple(chain.iloc[i + 1][c] for c in ("date", "expiry", "right", "strike"))
             assert a <= b, f"Row {i} unsorted: {a} > {b}"
+
+
+
+def test_compute_daily_rv_table_from_datetimeindex():
+    """compute_daily_rv_table works on a Databento-style DatetimeIndex DataFrame."""
+    rng = np.random.default_rng(42)
+    n = 50
+    idx = pd.date_range("2026-01-01", periods=n, freq="D", tz="America/New_York")
+    closes = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.01, n)))
+    opens = np.concatenate([[100.0], closes[:-1]])[:n] * np.exp(rng.normal(0.0, 0.005, n))
+    highs = np.maximum(opens, closes) * 1.005
+    lows = np.minimum(opens, closes) * 0.995
+    df = pd.DataFrame({"open": opens, "high": highs, "low": lows, "close": closes}, index=idx)
+    result = compute_daily_rv_table(df, window=20)
+    assert len(result) == n - 20, f"Expected {n - 20} rows, got {len(result)}"
+    assert "date" in result.columns
+    assert result["rv_20d"].notna().all()
+    assert (result["rv_20d"] > 0).all()
+
+
+def test_snapshot_strictly_excludes_post_1545():
+    """A valid (uncrossed) quote at 15:45:30 is strictly excluded."""
+    def _ny_epoch(h: int, m: int, s: int = 0) -> int:
+        utc_h = h + 4
+        if utc_h >= 24:
+            utc_h -= 24
+        return pd.Timestamp(f"2026-06-01 {utc_h:02d}:{m:02d}:{s:02d}", tz="UTC").value
+
+    rows = [
+        {"ts_event": _ny_epoch(15, 44), "instrument_id": "I1",
+         "bid_px_00": 1.02, "ask_px_00": 1.12, "bid_sz_00": 12, "ask_sz_00": 17},
+        {"ts_event": _ny_epoch(15, 45, 0), "instrument_id": "I1",
+         "bid_px_00": 1.03, "ask_px_00": 1.13, "bid_sz_00": 14, "ask_sz_00": 19},
+        {"ts_event": _ny_epoch(15, 45, 30), "instrument_id": "I1",
+         "bid_px_00": 1.06, "ask_px_00": 1.16, "bid_sz_00": 17, "ask_sz_00": 21},  # valid, uncrossed
+    ]
+    cbbo = pd.DataFrame(rows)
+    result = extract_daily_nbbo_snapshot(cbbo)
+    assert len(result) == 1, f"Expected 1 row (15:45:00 only), got {len(result)}"
+    assert result.iloc[0]["bid"] == pytest.approx(1.03, abs=1e-4)
+    assert result.iloc[0]["ask"] == pytest.approx(1.13, abs=1e-4)
+
+
+import subprocess
+import sys
+from pathlib import Path
+
+def test_fetch_opra_databento_import_and_help():
+    """Verify scripts/fetch_opra_databento.py compiles and --help exits 0."""
+    result = subprocess.run(
+        [sys.executable, "-m", "py_compile", "scripts/fetch_opra_databento.py"],
+        capture_output=True, text=True, cwd=str(Path(__file__).resolve().parents[2])
+    )
+    assert result.returncode == 0, f"py_compile failed: {result.stderr}"

@@ -115,14 +115,12 @@ def extract_daily_nbbo_snapshot(
     ny_time = _to_ny_time(df[ts_col])
     df["ny_time"] = ny_time
     df["date"] = ny_time.dt.strftime("%Y-%m-%d")
-    df["hour_et"] = ny_time.dt.hour
-    df["minute_et"] = ny_time.dt.minute
 
-    # Filter to rows within [snap_time - window, snap_time] ET
-    snap_deadline_minutes = snap_hour_et * 60 + snap_minute_et
-    snap_start_minutes = snap_deadline_minutes - window_minutes
-    df["_total_minutes"] = df["hour_et"] * 60 + df["minute_et"]
-    in_window = (df["_total_minutes"] >= snap_start_minutes) & (df["_total_minutes"] <= snap_deadline_minutes)
+    # Filter using total seconds so 15:45:30 is strictly excluded (even if valid)
+    snap_deadline_secs = snap_hour_et * 3600 + snap_minute_et * 60
+    snap_start_secs = snap_deadline_secs - window_minutes * 60
+    df["_total_secs"] = ny_time.dt.hour * 3600 + ny_time.dt.minute * 60 + ny_time.dt.second
+    in_window = (df["_total_secs"] >= snap_start_secs) & (df["_total_secs"] <= snap_deadline_secs)
     df = df.loc[in_window].copy()
     if df.empty:
         return pd.DataFrame(
@@ -174,7 +172,11 @@ def compute_daily_rv_table(
     bars_df: pd.DataFrame,
     window: int = 20,
 ) -> pd.DataFrame:
-    """Compute rv_20d (YZ RV) and spot (close) for each date, no lookahead."""
+    """Compute rv_20d (YZ RV) and spot (close) for each date, no lookahead.
+
+    Supports a ``"date"`` (ISO string), ``"ts_ns"`` (epoch ns), ``"ts_event"`` (epoch ns)
+    column, or a ``DatetimeIndex`` index.
+    """
     from src.quant.realized_vol import sanitize_ohlc, yang_zhang_rv
 
     if bars_df.empty:
@@ -183,6 +185,13 @@ def compute_daily_rv_table(
     df = bars_df.copy()
     if "date" in df.columns:
         df["_date"] = pd.to_datetime(df["date"], errors="coerce")
+    elif "ts_event" in df.columns:
+        df["_date"] = _to_ny_time(df["ts_event"])
+    elif isinstance(df.index, pd.DatetimeIndex):
+        df = df.reset_index()
+        df["_date"] = df[df.columns[0]]
+        if df["_date"].dt.tz is None:
+            df["_date"] = df["_date"].dt.tz_localize("UTC").dt.tz_convert(NY_TZ)
     elif "ts_ns" in df.columns:
         df["_date"] = pd.to_datetime(df["ts_ns"].astype("int64"), unit="ns", utc=True).dt.tz_convert(NY_TZ)
     else:
@@ -221,6 +230,8 @@ def build_opra_backtest_chain(
     dividend_yield: float = 0.0,
     min_dte: int = 1,
     max_dte: int = 90,
+    snap_hour_et: int = 15,
+    snap_minute_et: int = 45,
 ) -> pd.DataFrame:
     """Build the canonical daily backtest chain (Section 2 schema)."""
     from src.quant.black_scholes import bsm_implied_vols
@@ -229,7 +240,7 @@ def build_opra_backtest_chain(
     if parsed.empty:
         return pd.DataFrame(columns=CANONICAL_COLUMNS)
 
-    snapshot = extract_daily_nbbo_snapshot(cbbo_df)
+    snapshot = extract_daily_nbbo_snapshot(cbbo_df, snap_hour_et=snap_hour_et, snap_minute_et=snap_minute_et)
     if snapshot.empty:
         return pd.DataFrame(columns=CANONICAL_COLUMNS)
 
@@ -254,7 +265,7 @@ def build_opra_backtest_chain(
         return pd.DataFrame(columns=CANONICAL_COLUMNS)
 
     T = (merged["dte"] / 365.25).clip(lower=1e-6).values
-    S = merged["spot"].values
+    S = merged["spot"].values * np.exp(-dividend_yield * T)  # dividend-discounted per bsm_implied_vols docs
     K = merged["strike"].values
     r = np.full_like(T, risk_free_rate)
     flags = merged["right"].values
@@ -274,11 +285,9 @@ def build_opra_backtest_chain(
         target_dte = 30
         in_range = exp_dtes[(exp_dtes >= 21) & (exp_dtes <= 45)]
         if not in_range.empty:
-            sorted_dtes = in_range.sort_values()
-            best_idx = (sorted_dtes - target_dte).abs().argmin()
-            best_exp = sorted_dtes.index[best_idx]
+            best_exp = (in_range - target_dte).abs().idxmin()
         elif not exp_dtes.empty:
-            best_exp = exp_dtes.sort_values().index[0]
+            best_exp = (exp_dtes - target_dte).abs().idxmin()
         else:
             date_atm[date_str] = float("nan")
             continue

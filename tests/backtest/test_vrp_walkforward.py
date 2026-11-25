@@ -352,6 +352,8 @@ def test_delta_targeted_verticals_mode_in_backtest():
     spot = 40.0
     expiry = (START + timedelta(days=30)).isoformat()
     rows = []
+    # Add Call rows at the same strikes with very different prices — delta_targeted must still pick Put rows
+    call_quotes = {40.0: (1.00, 1.10), 38.0: (0.75, 0.85), 35.0: (0.30, 0.40)}
     for d in range(25):
         dt = (START + timedelta(days=d)).isoformat()
         for strike, (bid, ask) in [
@@ -363,6 +365,13 @@ def test_delta_targeted_verticals_mode_in_backtest():
                 "date": dt, "expiry": expiry, "dte": 30 - d,
                 "spot": spot, "rv_20d": 0.15, "atm_iv": 0.25,
                 "right": "P", "strike": strike, "bid": bid, "ask": ask,
+                "mid": round(0.5 * (bid + ask), 4), "iv": 0.25,
+            })
+        for strike, (bid, ask) in call_quotes.items():
+            rows.append({
+                "date": dt, "expiry": expiry, "dte": 30 - d,
+                "spot": spot, "rv_20d": 0.15, "atm_iv": 0.25,
+                "right": "C", "strike": strike, "bid": bid, "ask": ask,
                 "mid": round(0.5 * (bid + ask), 4), "iv": 0.25,
             })
     df = pd.DataFrame(rows)
