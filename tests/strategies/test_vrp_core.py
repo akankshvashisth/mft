@@ -155,8 +155,8 @@ def test_quote_precedence_strategy_then_cache_then_surface():
     a, b, c = enrich(raw, strategy, cache)
 
     assert (a["bid"], a["ask"], a["bid_size"], a["ask_size"]) == (2.05, 2.15, 30, 40)
-    assert (b["bid"], b["ask"], b["bid_size"], b["ask_size"]) == (1.45, 1.55, 7, 10)
-    assert (c["bid"], c["ask"], c["bid_size"], c["ask_size"]) == (1.0, 1.2, 10, 10)
+    assert (b["bid"], b["ask"], b["bid_size"], b["ask_size"]) == (1.45, 1.55, 7, None)
+    assert (c["bid"], c["ask"], c["bid_size"], c["ask_size"]) == (1.0, 1.2, None, None)
     assert c["mid"] == pytest.approx(1.1)
 
 

@@ -161,7 +161,7 @@ class VrpEngine:
         self.clock_ns = clock_ns
         self.monotonic = monotonic
 
-        self.quotes: dict[str, tuple[float, float, int, int]] = {}
+        self.quotes: dict[str, tuple[float, float, int | None, int | None]] = {}
         self.spot_mid: float = 0.0
         self.book = SpreadBook()
         self.working: dict[str, WorkingOrder] = {}
@@ -211,8 +211,8 @@ class VrpEngine:
             self.quotes[quote.instrument_id] = (
                 quote.bid,
                 quote.ask,
-                int(quote.bid_size or 10),
-                int(quote.ask_size or 10),
+                int(quote.bid_size) if quote.bid_size is not None else None,
+                int(quote.ask_size) if quote.ask_size is not None else None,
             )
 
     def leg_quote(self, instrument_id: str) -> tuple[float, float] | None:

@@ -25,7 +25,7 @@ DEFAULT_TOB_SIZE = 10
 POSITION_TOLERANCE = 1e-6
 
 Trade = dict[str, Any]
-StrategyQuote = tuple[float, float, int, int]   # bid, ask, bid size, ask size
+StrategyQuote = tuple[float, float, int | None, int | None]   # bid, ask, bid size, ask size
 
 
 # --- Spread book -----------------------------------------------------------------------------------
@@ -240,7 +240,8 @@ def enrich_surface_legs(
             continue
         bid = float(raw.get("bid") or 0.0)
         ask = float(raw.get("ask") or 0.0)
-        bid_size = ask_size = DEFAULT_TOB_SIZE
+        bid_size: int | None = None
+        ask_size: int | None = None
 
         own = strategy_quote(instrument_id)
         if own is not None:
@@ -251,8 +252,8 @@ def enrich_surface_legs(
             cached = cache_quote(instrument_id)
             if cached is not None and cached.mid is not None:
                 bid, ask = cached.bid, cached.ask
-                bid_size = int(cached.bid_size or DEFAULT_TOB_SIZE)
-                ask_size = int(cached.ask_size or DEFAULT_TOB_SIZE)
+                bid_size = int(cached.bid_size) if cached.bid_size is not None else None
+                ask_size = int(cached.ask_size) if cached.ask_size is not None else None
 
         mid = two_sided_mid(bid, ask)
         if mid is None:

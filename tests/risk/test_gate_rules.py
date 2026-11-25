@@ -238,6 +238,46 @@ def test_short_call_expiry_and_quantity_are_collected():
     assert (check.has_short_call, check.short_call_strike, check.short_call_extrinsic) == (True, 720.0, 1.4)
 
 
+def test_tob_size_zero_is_not_converted_and_rejected():
+    """bid_size=0 on a SELL leg is not converted to 10 and is rejected by check_legs()."""
+    check = check_legs([leg(bid_size=0, ask_size=0)], AS_OF, CFG)
+    assert "TOB_SIZE_UNKNOWN(SPY P690)" not in check.reasons  # 0 is known, just low
+    # With min_tob_size=4, size 0 should trigger LOW_TOB_SIZE
+    has_low_tob = any("LOW_TOB_SIZE" in r for r in check.reasons)
+    assert has_low_tob
+
+
+def test_tob_size_none_rejected_when_unknown_not_allowed():
+    """bid_size=None (surface fallback without TOB) is rejected when allow_unknown_tob_size=False."""
+    cfg = GateConfig(allow_unknown_tob_size=False)
+    check = check_legs([leg(bid_size=None, ask_size=None)], AS_OF, cfg)
+    assert any("TOB_SIZE_UNKNOWN" in r for r in check.reasons)
+
+
+def test_tob_size_none_allowed_as_warning_when_configured():
+    """bid_size=None is downgraded to a warning when allow_unknown_tob_size=True."""
+    cfg = GateConfig(allow_unknown_tob_size=True)
+    check = check_legs([leg(bid_size=None, ask_size=None)], AS_OF, cfg)
+    assert check.reasons == []  # No block reasons
+    assert any("TOB_SIZE_UNKNOWN" in w for w in check.warnings)
+
+
+def test_tob_participation_zero_blocks_when_cap_is_zero():
+    """tob_size=2 with max_tob_participation=0.25 produces tob_cap=0 and blocks entry."""
+    cfg = GateConfig(max_tob_participation=0.25, min_tob_size=1)
+    check = check_legs([leg(qty=5, bid_size=2, ask_size=2)], AS_OF, cfg)
+    assert check.capped_qty == 0
+    assert any("TOB_PARTICIPATION_ZERO" in r for r in check.reasons)
+
+
+def test_oi_participation_zero_blocks_when_cap_is_zero():
+    """open_interest=5 with max_oi_participation=0.10 produces oi_cap=0 and blocks entry."""
+    cfg = GateConfig(max_oi_participation=0.10)
+    check = check_legs([leg(qty=5, open_interest=5)], AS_OF, cfg)
+    assert check.capped_qty == 0
+    assert any("OI_PARTICIPATION_ZERO" in r for r in check.reasons)
+
+
 def test_no_legs_means_nothing_to_trade():
     check = check_legs([], AS_OF, CFG)
     assert (check.capped_qty, check.max_expiry) == (0, AS_OF)

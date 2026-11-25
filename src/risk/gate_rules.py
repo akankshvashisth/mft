@@ -178,16 +178,32 @@ def check_legs(legs: Sequence[CandidateLegSpec], as_of: date, cfg: GateConfig) -
                 out.reasons.append(
                     f"LOW_OPEN_INTEREST({leg.instrument_id}: OI={leg.open_interest}<{cfg.min_open_interest})"
                 )
-            oi_cap = max(1, int(leg.open_interest * cfg.max_oi_participation))
-            if oi_cap < out.capped_qty:
+            oi_cap = int(leg.open_interest * cfg.max_oi_participation)
+            if oi_cap < 1:
+                out.reasons.append(f"OI_PARTICIPATION_ZERO({leg.instrument_id})")
+                out.capped_qty = 0
+            elif oi_cap < out.capped_qty:
                 out.capped_qty = oi_cap
                 out.warnings.append(f"QTY_CAPPED_BY_OI({leg.instrument_id}: {oi_cap})")
 
         tob_size = leg.bid_size if leg.side == "SELL" else leg.ask_size
-        tob_cap = max(1, int(tob_size * cfg.max_tob_participation))
-        if tob_cap < out.capped_qty:
-            out.capped_qty = tob_cap
-            out.warnings.append(f"QTY_CAPPED_BY_TOB({leg.instrument_id}: {tob_cap})")
+        if tob_size is None:
+            if cfg.allow_unknown_tob_size:
+                out.warnings.append(f"TOB_SIZE_UNKNOWN({leg.instrument_id})")
+            else:
+                out.reasons.append(f"TOB_SIZE_UNKNOWN({leg.instrument_id})")
+        else:
+            if tob_size < cfg.min_tob_size:
+                out.reasons.append(
+                    f"LOW_TOB_SIZE({leg.instrument_id}: size={tob_size}<{cfg.min_tob_size})"
+                )
+            tob_cap = int(tob_size * cfg.max_tob_participation)
+            if tob_cap < 1:
+                out.reasons.append(f"TOB_PARTICIPATION_ZERO({leg.instrument_id})")
+                out.capped_qty = 0
+            elif tob_cap < out.capped_qty:
+                out.capped_qty = tob_cap
+                out.warnings.append(f"QTY_CAPPED_BY_TOB({leg.instrument_id}: {tob_cap})")
 
         if leg.right == "C" and leg.side == "SELL":
             out.has_short_call = True
