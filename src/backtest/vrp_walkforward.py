@@ -24,10 +24,10 @@ MIN_NATURAL_CREDIT = 0.05
 EXIT_SLIPPAGE_FRAC = 0.50
 ROUND_TRIP_COMMISSION_PER_LOT = 2.60
 PROFIT_TARGET_FRACTION = 0.50
-MIN_EXIT_DTE = 1
+MIN_EXIT_DTE = 14                             # Matches live VrpSettings
 ASSUMED_CARRY = 0.03
 ASSUMED_DIVIDEND_YIELD = 0.0125
-MAX_LEG_SPREAD_PCT = 1.0   # 100% of mid — permissive for widely-spaced synthetic test data
+MAX_LEG_SPREAD_PCT = 0.18                     # Matches live GateConfig
 MIN_OPEN_INTEREST = 100
 
 # --- Exit reason codes ---------------------------------------------------------------------------
@@ -42,9 +42,9 @@ def select_put_spread(day_df: pd.DataFrame, spot: float) -> tuple[pd.Series, pd.
     return short_candidates.iloc[-1], short_candidates.iloc[-3]
 
 
-def _quote_by_strike(day_df: pd.DataFrame, strike: float) -> pd.Series | None:
-    """Return the option row for a given strike on a given day, or None if missing."""
-    matches = day_df[day_df["strike"] == strike]
+def _quote_by_strike(day_df: pd.DataFrame, strike: float, right: str = "P") -> pd.Series | None:
+    """Return the option row for a given strike and right (C/P) on a given day, or None if missing."""
+    matches = day_df[(day_df["right"] == right) & (day_df["strike"] == strike)]
     if len(matches) == 0:
         return None
     return matches.iloc[0]
@@ -61,8 +61,8 @@ def compute_exit_debit(
     Returns (exit_debit, is_fallback). When either strike lacks a quote on the exit date,
     ``is_fallback = True`` and the function returns ``None`` as the debit.
     """
-    short_row = _quote_by_strike(day_df, short_strike)
-    long_row = _quote_by_strike(day_df, long_strike)
+    short_row = _quote_by_strike(day_df, short_strike, right="P")
+    long_row = _quote_by_strike(day_df, long_strike, right="P")
     if short_row is not None and long_row is not None:
         short_mid = float(short_row["mid"])
         short_ask = float(short_row["ask"])
@@ -95,10 +95,12 @@ def bsm_fallback_exit_debit(
     short_bsm = float(np.asarray(price_fn(spot, short_strike, ttm_years, risk_free_rate, atm_iv, "p", dividend_yield)).flat[0])
     long_bsm = float(np.asarray(price_fn(spot, long_strike, ttm_years, risk_free_rate, atm_iv, "p", dividend_yield)).flat[0])
     net_mid = short_bsm - long_bsm
-    short_spread = abs(short_bsm * 0.02)
-    long_spread = abs(long_bsm * 0.02)
+    short_spread = max(0.05, 0.10 * abs(short_bsm))
+    long_spread = max(0.05, 0.10 * abs(long_bsm))
     penalty = exit_slippage_frac * (short_spread + long_spread) / 2.0
     return max(net_mid + penalty, 0.0)
+
+
 def put_spread_combo(
     symbol: str, spot: float, short: pd.Series, wing: pd.Series, mid_credit: float, width: float
 ) -> CandidateCombo:
@@ -157,6 +159,8 @@ def _gate_parity_checks(
             if oi_val < min_open_interest:
                 reasons.append(f"LOW_OPEN_INTEREST({label}:{oi_val} < {min_open_interest})")
     return reasons
+
+
 def run_midcap_vrp_backtest(
     df: pd.DataFrame,
     sleeve_equity_usd: float = 100_000.0,
@@ -172,6 +176,9 @@ def run_midcap_vrp_backtest(
     min_exit_dte: int = MIN_EXIT_DTE,
     max_holding_days: int = HOLDING_DAYS,
     commission_per_lot: float = ROUND_TRIP_COMMISSION_PER_LOT,
+    max_concurrent_trades: int = 1,
+    max_leg_spread_pct: float = MAX_LEG_SPREAD_PCT,
+    min_open_interest: int = MIN_OPEN_INTEREST,
 ) -> dict[str, Any]:
     """Walk-forward mid-cap VRP simulation with quote-marked exits and live-gate parity.
 
@@ -204,6 +211,12 @@ def run_midcap_vrp_backtest(
         Max calendar holding days before a TIME_STOP exit fires.
     commission_per_lot : float
         Round-trip commissions deducted from each trade's P&L.
+    max_concurrent_trades : int
+        Maximum number of concurrently open trades (default 1).
+    max_leg_spread_pct : float
+        Maximum allowed leg spread as fraction of mid.
+    min_open_interest : int
+        Minimum open interest to allow leg entry (applied when column present).
 
     Returns
     -------
@@ -283,6 +296,11 @@ def run_midcap_vrp_backtest(
             still_open.append(t)
         open_trades = still_open
 # --- 2. Try to enter a new trade ---------------------------------------------------------
+        if idx >= len(grouped) - 1:
+            continue  # Don't enter on the last day (trades would force-close immediately)
+        if len(open_trades) >= max_concurrent_trades:
+            continue
+
         ev_chk = calendar.check_entry(symbol, as_of=as_of, expiry_date=as_of + timedelta(days=TARGET_DTE_DAYS))
         if vrp < MIN_VRP or not ev_chk.allowed:
             continue
@@ -295,7 +313,10 @@ def run_midcap_vrp_backtest(
         mid_credit = float(short["mid"] - wing["mid"])
         nat_credit = float(short["bid"] - wing["ask"])
 
-        gate_reasons = _gate_parity_checks(day_df, short, wing, mid_credit, nat_credit)
+        gate_reasons = _gate_parity_checks(
+            day_df, short, wing, mid_credit, nat_credit,
+            max_leg_spread_pct=max_leg_spread_pct, min_open_interest=min_open_interest,
+        )
         if gate_reasons:
             gate_rejects += 1
             continue
@@ -326,17 +347,21 @@ def run_midcap_vrp_backtest(
             "entry_credit": mid_credit,
         })
 # --- Force-close trades still open at simulation end --------------------------------------------
+    last_group = grouped[-1]
+    last_df = last_group[1]
     for t in open_trades:
-        last_group = grouped[-1]
-        last_spot = float(last_group[1]["spot"].iloc[0])
-        last_iv = float(last_group[1]["atm_iv"].iloc[0])
-        days_held = (grouped_dates[-1] - t["entry_date"]).days
-        ttm_remaining = max(TARGET_DTE_DAYS - days_held, 1.0)
-        exit_debit = bsm_fallback_exit_debit(
-            t["short_strike"], t["long_strike"], last_spot, last_iv,
-            ttm_remaining, exit_slippage_frac,
-        )
-        fallback_exit_marks += 1
+        # Try quote-based exit first
+        exit_debit, is_fallback = compute_exit_debit(last_df, t["short_strike"], t["long_strike"], exit_slippage_frac)
+        if is_fallback:
+            last_spot = float(last_df["spot"].iloc[0])
+            last_iv = float(last_df["atm_iv"].iloc[0])
+            days_held = (grouped_dates[-1] - t["entry_date"]).days
+            ttm_remaining = max(TARGET_DTE_DAYS - days_held, 1.0)
+            exit_debit = bsm_fallback_exit_debit(
+                t["short_strike"], t["long_strike"], last_spot, last_iv,
+                ttm_remaining, exit_slippage_frac,
+            )
+            fallback_exit_marks += 1
         pnl = (t["entry_fill"] - exit_debit) * 100.0 * t["lots"] - commission_per_lot * t["lots"]
         trades.append({
             **t, "pnl_usd": round(pnl, 2), "exit_reason": TIME_STOP,
@@ -354,6 +379,16 @@ def run_midcap_vrp_backtest(
 
     total_return = equity - sleeve_equity_usd
     total_friction_usd = commission_per_lot * float(np.sum([t["lots"] for t in trades])) if trades else 0.0
+    # Add estimated entry + exit spread slippage: (2 * slippage_frac * half_spread) per trade
+    for t in trades:
+        width = t.get("width", 0.0)
+        if width > 0:
+            entry_debit = t["entry_fill"]
+            exit_debit = t.get("exit_debit", 0.0)
+            # Half-spread ≈ width * 0.03 (typical mid-cap option spread); use a simple proxy
+            est_half_spread = width * 0.03
+            slippage_cost = 2.0 * exit_slippage_frac * est_half_spread * 100.0 * t["lots"]
+            total_friction_usd += slippage_cost
     avg_hold = float(np.mean([t.get("holding_calendar_days", 0) for t in trades])) if trades else 0.0
 
     if n >= 2 and float(np.std(pnls)) > 0:
@@ -381,4 +416,3 @@ def run_midcap_vrp_backtest(
         "fallback_exit_marks": fallback_exit_marks,
         "total_friction_usd": round(total_friction_usd, 2),
     }
-    rng = np.random.default_rng(seed)
