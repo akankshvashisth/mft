@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from collections.abc import Callable
@@ -23,6 +24,25 @@ class PassiveExecutionConfig:
     dwell_seconds: float = 20.0             # Seconds to rest passive order before stepping
     adverse_spot_move_pct: float = 0.0025   # Cancel/reprice if underlying moves >= 25 bps against us
     slippage_log_path: str = "logs/execution_slippage.jsonl"
+    tick_size: float = 0.01                 # Default minimum price increment
+
+
+def round_to_tick(price: float, tick_size: float, side: str) -> float:
+    """Round price defensively to the nearest tick so the limit never crosses the spread.
+
+    For CREDIT_OPEN (selling), round up so the limit is at or above the tick grid.
+    For DEBIT_CLOSE (buying), round down so the limit is at or below the tick grid.
+    Otherwise, round to nearest.
+
+    Uses a tiny epsilon (1e-9) to avoid floating-point truncation at exact tick boundaries.
+    """
+    eps = 1e-9
+    units = price / tick_size
+    if side == CREDIT_OPEN:
+        return math.ceil(units - eps) * tick_size
+    if side == DEBIT_CLOSE:
+        return math.floor(units + eps) * tick_size
+    return round(units) * tick_size
 
 
 @dataclass
@@ -37,6 +57,8 @@ class ChildClipOrder:
     net_mid_price: float        # Positive = credit received, or debit paid
     net_natural_price: float    # Immediate fill price (worse than mid)
     current_limit_price: float
+    arrival_mid_price: float | None = None    # Immutable arrival price for shortfall measurement
+    arrival_natural_price: float | None = None
     step_count: int = 0
     last_step_ts: float = field(default_factory=time.monotonic)
     status: str = "WORKING"     # "WORKING", "FILLED", "CANCELLED_ADVERSE", "CANCELLED_CAP"
@@ -71,8 +93,8 @@ def slippage_record(
 ) -> dict[str, Any]:
     """Post-trade audit record; positive slippage_usd = cost paid vs. the modeled mid."""
     if clip is not None:
-        mid_ref = clip.net_mid_price
-        nat_ref = clip.net_natural_price
+        mid_ref = clip.arrival_mid_price if clip.arrival_mid_price is not None else clip.net_mid_price
+        nat_ref = clip.arrival_natural_price if clip.arrival_natural_price is not None else clip.net_natural_price
         lots = clip.lots if filled_lots is None else filled_lots
         side = clip.side
         underlying = clip.underlying
@@ -169,6 +191,8 @@ class PassiveComboExecutor:
                 ref_spot=spot_price,
                 net_mid_price=round(net_mid_price, 4),
                 net_natural_price=round(net_natural_price, 4),
+                arrival_mid_price=round(net_mid_price, 4),
+                arrival_natural_price=round(net_natural_price, 4),
                 current_limit_price=init_limit,
                 last_step_ts=now,
             )
@@ -196,11 +220,15 @@ class PassiveComboExecutor:
         new_natural_price: float,
         now_mono: float | None = None,
         parent_order_id: str | None = None,
+        rv_20d: float | None = None,
     ) -> list[dict]:
         """Evaluates working clips for adverse spot moves or dwell-timer limit stepping.
 
         Mid/natural prices belong to a single combo, so pass parent_order_id whenever clips of different
         combos can be working at the same time.
+
+        When ``rv_20d`` is provided the adverse-spot threshold is at least
+        ``max(cfg.adverse_spot_move_pct, 0.15 * rv_20d / sqrt(252))`` (one-sigma daily).
         """
         now = now_mono if now_mono is not None else self.clock()
         actions: list[dict] = []
@@ -212,7 +240,11 @@ class PassiveComboExecutor:
                 continue
 
             spot_move_pct = abs(current_spot - clip.ref_spot) / max(clip.ref_spot, 1e-6)
-            if spot_move_pct >= self.cfg.adverse_spot_move_pct:
+            adverse_threshold = self.cfg.adverse_spot_move_pct
+            if rv_20d is not None and rv_20d > 0.0:
+                daily_sigma = rv_20d / math.sqrt(252.0)
+                adverse_threshold = max(adverse_threshold, 0.15 * daily_sigma)
+            if spot_move_pct >= adverse_threshold:
                 clip.status = "CANCELLED_ADVERSE"
                 actions.append(
                     {

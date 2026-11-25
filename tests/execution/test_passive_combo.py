@@ -5,8 +5,11 @@ from unittest import mock
 import pytest
 
 from src.execution.passive_combo import (
+    CREDIT_OPEN,
+    DEBIT_CLOSE,
     PassiveComboExecutor,
     PassiveExecutionConfig,
+    round_to_tick,
     slippage_record,
     stepped_limit,
 )
@@ -167,3 +170,44 @@ def test_default_sink_writes_lazily(tmp_path):
 def test_default_parent_ids_are_random_hex():
     clip = PassiveComboExecutor(fill_sink=recording_sink()).create_parent_plan("SPY", "x", "CREDIT_OPEN", 1, 700.0, 1.0, 0.8)[0]
     assert re.fullmatch(r"CMB-[0-9A-F]{10}", clip.parent_order_id)
+
+
+# --- Arrival mid & tick sizing --------------------------------------------------------------------
+
+
+def test_arrival_mid_unchanged_after_limit_steps(executor, clock):
+    """After 2 limit steps with changing new_mid_price, clip.arrival_mid_price stays at creation mid."""
+    (clip,) = plan(executor, lots=5, mid=1.00, natural=0.80)
+    assert clip.arrival_mid_price == 1.00
+    assert clip.arrival_natural_price == 0.80
+
+    # Step 1
+    clock.return_value += 20.0
+    executor.on_market_tick("SPY.ARCA", 700.0, 0.95, 0.75, now_mono=clock())
+    assert clip.arrival_mid_price == 1.00  # Unchanged from creation
+    assert clip.arrival_natural_price == 0.80
+
+    # Step 2
+    clock.return_value += 20.0
+    executor.on_market_tick("SPY.ARCA", 700.0, 0.90, 0.70, now_mono=clock())
+    assert clip.arrival_mid_price == 1.00  # Still unchanged
+
+
+def test_arrival_mid_used_in_slippage_record(executor):
+    """record_fill logs shortfall vs arrival_mid_price, not current net_mid_price."""
+    (clip,) = plan(executor, lots=8, mid=1.00, natural=0.80)
+    clip.net_mid_price = 0.90  # Step advanced
+    record = executor.record_fill(clip.clip_id, 0.95, 5.2)
+    # Shortfall against arrival 1.00 (not current 0.90): 1.00 - 0.95 = 0.05 * 100 * 8 = 40
+    assert record["slippage_usd"] == 40.0
+    assert record["modeled_mid"] == 1.0
+
+
+def test_round_to_tick():
+    """round_to_tick with tick_size=0.05 rounds 1.23 -> 1.25 for CREDIT_OPEN and 1.20 for DEBIT_CLOSE."""
+    assert round_to_tick(1.23, 0.05, CREDIT_OPEN) == 1.25
+    assert round_to_tick(1.23, 0.05, DEBIT_CLOSE) == pytest.approx(1.20)
+    assert round_to_tick(1.20, 0.05, CREDIT_OPEN) == pytest.approx(1.20)  # Exact tick, but float
+    assert round_to_tick(1.20, 0.05, DEBIT_CLOSE) == pytest.approx(1.20)
+    assert round_to_tick(1.249, 0.05, CREDIT_OPEN) == 1.25
+    assert round_to_tick(1.249, 0.05, DEBIT_CLOSE) == pytest.approx(1.20)

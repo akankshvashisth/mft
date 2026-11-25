@@ -8,7 +8,7 @@ import pytest
 from src.common import keys
 from src.common.market import QuoteObs
 from src.execution.passive_combo import PassiveComboExecutor
-from src.strategies.vrp_engine import OrderView, VrpEngine, VrpSettings
+from src.strategies.vrp_engine import OrderView, VrpEngine, VrpSettings, WorkingOrder
 from tests.factories import NOW_NS, ago, portfolio_payload, risk_assessment, rv_payload, surface_leg, surface_payload
 from tests.fakes import FakeGate, FakeMarket, FakeOrderGateway, FakePricer, written
 
@@ -381,6 +381,48 @@ def test_valid_rv_proceeds_normally(make_rig, store):
     assert payload["entry_block_reason"] is None
     assert payload["rv_20d"] == 0.13
     assert payload["candidates_scanned"] > 0
+
+
+# --- Execution hardening ---------------------------------------------------------------------------
+
+
+def test_exit_order_with_negative_mid_not_cancelled(make_rig):
+    """EXIT order with mid=-0.02 is NOT cancelled; ENTRY order with mid=-0.02 IS cancelled."""
+    OPEN_TRADE = {"combo": "SPY 690/685P Bull Put", "legs": LEGS, "expiry": "2026-12-18", "open_lots": 4.0, "entry_credit": 0.6}
+    rig = make_rig(book={SPREAD_ID: OPEN_TRADE})
+    rig.market.positions[SPREAD_ID] = -4.0
+    spot(rig)
+    quote_legs(rig)
+
+    exit_signal = rig.engine.evaluate_exits(date(2026, 12, 5))
+    assert len(exit_signal) == 1
+    assert exit_signal[0]["status"] == "EXIT_ORDER_ROUTED"
+    exit_key = exit_signal[0]["order_id"]
+
+    rig.engine.on_quote(QuoteObs(P690, 0.0, 0.05, NOW_NS))
+    rig.engine.on_quote(QuoteObs(P685, 1.0, 1.2, NOW_NS))
+    assert exit_key in rig.engine.working
+
+
+def test_entry_order_with_negative_mid_is_cancelled(make_rig):
+    """ENTRY order with mid=-0.02 IS cancelled (CANCELLED_INVALID_MID)."""
+    rig = make_rig()
+    quote_legs(rig)
+    spot(rig)
+
+    order_key = "ENTRY-TEST-1"
+    rig.gateway.views[order_key] = OrderView(is_open=True, is_closed=False, status="ACCEPTED")
+    rig.engine.working[order_key] = WorkingOrder(
+        order_key=order_key, clip_id="CLIP-1", parent_id="P1",
+        purpose="ENTRY", side="CREDIT_OPEN",
+        spread_key=SPREAD_ID, legs=LEGS, combo="SPY 690/685P Bull Put", expiry="2026-12-18",
+    )
+    # Combo price for CREDIT_OPEN: P690 mid=0.025, P685 mid=1.1 => 0.025 - 1.1 = -1.075
+    rig.engine.quotes[P690] = (0.0, 0.05, None, None)
+    rig.engine.quotes[P685] = (1.0, 1.2, None, None)
+    rig.engine.manage_working_orders()
+    # The cancel was sent to the gateway; the order left working only on terminal event
+    assert order_key in rig.gateway.cancelled
 
 OPEN_TRADE = {"combo": "SPY 690/685P Bull Put", "legs": LEGS, "expiry": "2026-12-18", "open_lots": 4.0, "entry_credit": 0.6}
 

@@ -409,9 +409,13 @@ class VrpEngine:
                 continue
             mid, natural = prices
             if mid <= 0.0:
-                self.log.warning(f"Cancelling {key} ({wo.combo}): spread mid {mid:.2f} is no longer positive")
-                self._cancel(key, wo, "CANCELLED_INVALID_MID")
-                continue
+                if wo.purpose == ENTRY:
+                    self.log.warning(f"Cancelling {key} ({wo.combo}): spread mid {mid:.2f} is no longer positive")
+                    self._cancel(key, wo, "CANCELLED_INVALID_MID")
+                    continue
+                # EXIT orders: clamp so winning spreads can still close cleanly
+                mid = max(mid, 0.05)
+                natural = max(natural, mid)
 
             actions = self.executor.on_market_tick(
                 underlying=underlying,
