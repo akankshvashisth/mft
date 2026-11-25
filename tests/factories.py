@@ -151,10 +151,13 @@ def positions_payload(now_ns: int = NOW_NS, **overrides: Any) -> dict[str, Any]:
         "equity": 100_000.0,
         "high_water_mark": 100_000.0,
         "drawdown_pct": 0.0,
+        "prior_carry_usd": 0.0,
         "realized_total_usd": 0.0,
         "unrealized_pnl_usd": 0.0,
         "open_positions": 0,
         "ts_ns": now_ns,
+        "session_date": "",
+        "session_realized_usd": 0.0,
     }
     payload.update(overrides)
     return payload

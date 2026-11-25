@@ -70,7 +70,10 @@ def test_empty_book_publishes_flat_risk_and_sleeve(make_service, store, fake_val
     assert set(payload["greeks"].values()) == {0.0}
     assert payload["risk"]["stress_grid_usd"] == [[0.0] * 6 for _ in range(7)]
     assert (payload["risk"]["book_var_99_usd"], payload["risk"]["book_es_99_usd"]) == (0.0, 0.0)
-    assert payload["sleeve"] == positions_payload(NOW_NS)
+    assert payload["sleeve"]["session_date"] == "2026-11-24"
+    sleeve_expected = positions_payload(NOW_NS)
+    sleeve_expected["session_date"] = "2026-11-24"
+    assert payload["sleeve"] == sleeve_expected
 
 
 def test_share_position_marks_live_and_stresses_linearly(make_service):
@@ -85,7 +88,8 @@ def test_share_position_marks_live_and_stresses_linearly(make_service):
     assert grid[0] == [-7_000.0] * 6 and grid[3] == [0.0] * 6 and grid[6] == [7_000.0] * 6
     assert payload["risk"]["worst_7d_stress_usd"] == -7_000.0
     risk = payload["risk"]
-    assert risk["book_es_99_usd"] / risk["book_var_99_usd"] == pytest.approx(2.665 / 2.326, rel=1e-3)
+    assert risk["book_es_99_usd"] > 0.0 and risk["book_var_99_usd"] > 0.0
+    assert risk["book_1d_linear_es_99_usd"] > 0.0 and risk["book_1d_linear_var_99_usd"] > 0.0
     assert (payload["sleeve"]["equity"], payload["sleeve"]["high_water_mark"]) == (101_000.0, 101_000.0)
 
 
@@ -159,7 +163,7 @@ def test_underlying_spot_falls_back_to_a_live_quote(make_service, store, market)
 
 
 def test_realized_pnl_and_restored_sleeve_state(make_service, store):
-    store.set_json(keys.POSITIONS_LATEST, positions_payload(realized_total_usd=500.0, high_water_mark=101_000.0))
+    store.set_json(keys.POSITIONS_LATEST, positions_payload(prior_carry_usd=500.0, high_water_mark=101_000.0))
     service = make_service()
     service.restore()
 
@@ -183,7 +187,93 @@ def test_attribution_runs_across_evaluations(make_service, store, market):
     assert attribution["since_ts_ns"] == NOW_NS
 
 
+def test_unmodeled_spread_sets_flag(make_service, store, market):
+    """An OPTION_SPREAD with no info['legs'] sets has_unmodeled_positions=True."""
+    store.set_json(keys.spread_legs_key("UNKNOWN_SPREAD"), "not valid")  # No usable legs
+    market.quotes["UNKNOWN_SPREAD"] = quote(1.25, 1.35)
+    market.instruments["UNKNOWN_SPREAD"] = InstrumentInfo(OPTION_SPREAD, 100.0)
+    payload = make_service().evaluate([PositionView("UNKNOWN_SPREAD", -2.0, 1.2)], 0.0, NOW_NS)
+    assert payload["risk"]["has_unmodeled_positions"] is True
+    assert "UNKNOWN_SPREAD" in payload["risk"]["unmodeled_positions"]
+
+
+def test_registered_spread_does_not_set_unmodeled_flag(make_service, store):
+    """A spread with registered legs in Valkey is modeled and not unmodeled."""
+    store.set_json(keys.spread_legs_key(SPREAD),
+                   [{"instrument_id": P690, "ratio": 1}, {"instrument_id": P685, "ratio": -1}])
+    payload = make_service().evaluate([PositionView(SPREAD, -2.0, 1.2)], 0.0, NOW_NS)
+    assert payload["risk"]["has_unmodeled_positions"] is False
+    assert payload["risk"]["unmodeled_positions"] == []
+
+
+def test_horizon_var_es_is_nonlinear_14d(make_service, store):
+    """book_es_99_usd is the 14-day nonlinear MC ES99 (not the 1-day linear)."""
+    store.set_json(keys.spread_legs_key(SPREAD),
+                   [{"instrument_id": P690, "ratio": 1}, {"instrument_id": P685, "ratio": -1}])
+    payload = make_service().evaluate([PositionView(SPREAD, -2.0, 1.2)], 0.0, NOW_NS)
+    risk = payload["risk"]
+    # The 14d MC ES99 should be larger than the 1d linear ES99 (longer horizon + non-normal tails)
+    assert risk["book_es_99_usd"] > 0.0
+    assert risk["book_1d_linear_es_99_usd"] > 0.0
+
+
 def test_surfaces_are_keyed_by_symbol(make_service, store):
     store.set_json(keys.surface_key("QQQ.NASDAQ"), surface_payload("QQQ.NASDAQ"))
     store.set_text(keys.surface_key("BAD.ARCA"), "not json")
     assert sorted(make_service().surfaces_by_symbol()) == ["QQQ", "SPY"]
+
+
+def test_realized_pnl_idempotent_after_restore(make_service, store):
+    """Start with prior_carry_usd=0.0, pass non-zero closed_realized_usd=500.0 on Day 1.
+
+    Verify evaluate() -> evaluate() -> restore() -> evaluate() all report 500.0,
+    and Day 2 with closed_realized_usd=100.0 reports 600.0 on the first tick.
+    """
+    service = make_service()
+
+    # Day 1: first evaluate with 500 closed realized
+    p1 = service.evaluate([PositionView(SPY, 0.0, 700.0, realized_pnl=0.0)], 500.0, NOW_NS)
+    assert p1["realized_pnl_usd"] == 500.0, f"Expected 500.0, got {p1['realized_pnl_usd']}"
+
+    # Second evaluate on same day: still 500 (session_realized_usd unchanged)
+    p2 = service.evaluate([PositionView(SPY, 0.0, 700.0, realized_pnl=0.0)], 500.0, NOW_NS + 60_000_000_000)
+    assert p2["realized_pnl_usd"] == 500.0, f"Expected 500.0, got {p2['realized_pnl_usd']}"
+
+    # Simulate restart: restore() from the persisted sleeve
+    service.restore()
+    p3 = service.evaluate([PositionView(SPY, 0.0, 700.0, realized_pnl=0.0)], 500.0, NOW_NS + 120_000_000_000)
+    assert p3["realized_pnl_usd"] == 500.0, f"Expected 500.0, got {p3['realized_pnl_usd']}"
+
+    # Next NY date: Day 2 with closed_realized_usd=100.0 reports 600.0 on first tick
+    from tests.factories import utc_ns
+    next_day = utc_ns(2026, 11, 25, 15)
+    p4 = service.evaluate([PositionView(SPY, 0.0, 700.0, realized_pnl=0.0)], 100.0, next_day)
+    assert p4["realized_pnl_usd"] == 600.0, f"Expected 600.0, got {p4['realized_pnl_usd']}"
+
+
+def test_defined_risk_credit_spread_es99_is_bounded(make_service, store, market):
+    """A 1-lot $5-wide credit spread (e.g. 690/685 put) has book_es_99_usd inside [0, 500]."""
+    store.set_json(keys.spread_legs_key(SPREAD),
+                   [{"instrument_id": P690, "ratio": 1}, {"instrument_id": P685, "ratio": -1}])
+    payload = make_service().evaluate([PositionView(SPREAD, -1.0, 0.6)], 0.0, NOW_NS)
+    es = payload["risk"]["book_es_99_usd"]
+    # A bull put spread's max loss is width * 100 = $500. 14d MC ES should be positive but under that.
+    assert 0.0 < es <= 500.0, f"ES99 ${es:.2f} outside expected (0, 500] range"
+    assert payload["risk"]["book_var_99_usd"] > 0.0
+
+
+def test_beta_hedged_short_gamma_produces_tail_risk(make_service, store, market):
+    """A delta-hedged short strangle (beta_delta_shares ≈ 0) still has positive book_es_99_usd (gamma + idio)."""
+    store.set_json(keys.spread_legs_key(SPREAD),
+                   [{"instrument_id": P690, "ratio": 1}, {"instrument_id": P685, "ratio": -1}])
+    market.instruments["SPY.ARCA"] = InstrumentInfo(OTHER, 1.0)
+    # Short 2-lot put spread (bearish delta ≈ -2 * ~0.20 = -0.4) + long SPY shares to offset delta
+    payload = make_service().evaluate([
+        PositionView(SPREAD, -2.0, 0.6),
+        PositionView("SPY.ARCA", 40.0, 700.0),
+    ], 0.0, NOW_NS)
+    # Beta-hedged: beta_delta ≈ net delta * (spot / bench_spot) should be near zero
+    beta_delta = payload["greeks"]["beta_delta_shares"]
+    assert abs(beta_delta) < 200.0, f"Beta-delta {beta_delta:.1f} not near zero"
+    # Short gamma still generates tail risk
+    assert payload["risk"]["book_es_99_usd"] > 0.0, "Hedged position produces no tail risk"

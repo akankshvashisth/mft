@@ -152,6 +152,12 @@ def test_fresh_but_unreadable_book_es99_blocks(payload):
     assert book_es99_usd(payload) == 0.0
 
 
+def test_unmodeled_positions_block_entry():
+    """has_unmodeled_positions=True in the portfolio payload blocks entry."""
+    payload = portfolio_payload(risk={"book_es_99_usd": 100.0, "has_unmodeled_positions": True})
+    assert portfolio_reasons(payload, NOW_NS, 120.0) == ["PORTFOLIO_HAS_UNMODELED_POSITIONS"]
+
+
 # --- Order-rate throttle ---------------------------------------------------------------------------
 
 
@@ -238,6 +244,46 @@ def test_short_call_expiry_and_quantity_are_collected():
     assert (check.has_short_call, check.short_call_strike, check.short_call_extrinsic) == (True, 720.0, 1.4)
 
 
+def test_tob_size_zero_is_not_converted_and_rejected():
+    """bid_size=0 on a SELL leg is not converted to 10 and is rejected by check_legs()."""
+    check = check_legs([leg(bid_size=0, ask_size=0)], AS_OF, CFG)
+    assert "TOB_SIZE_UNKNOWN(SPY P690)" not in check.reasons  # 0 is known, just low
+    # With min_tob_size=4, size 0 should trigger LOW_TOB_SIZE
+    has_low_tob = any("LOW_TOB_SIZE" in r for r in check.reasons)
+    assert has_low_tob
+
+
+def test_tob_size_none_rejected_when_unknown_not_allowed():
+    """bid_size=None (surface fallback without TOB) is rejected when allow_unknown_tob_size=False."""
+    cfg = GateConfig(allow_unknown_tob_size=False)
+    check = check_legs([leg(bid_size=None, ask_size=None)], AS_OF, cfg)
+    assert any("TOB_SIZE_UNKNOWN" in r for r in check.reasons)
+
+
+def test_tob_size_none_allowed_as_warning_when_configured():
+    """bid_size=None is downgraded to a warning when allow_unknown_tob_size=True."""
+    cfg = GateConfig(allow_unknown_tob_size=True)
+    check = check_legs([leg(bid_size=None, ask_size=None)], AS_OF, cfg)
+    assert check.reasons == []  # No block reasons
+    assert any("TOB_SIZE_UNKNOWN" in w for w in check.warnings)
+
+
+def test_tob_participation_zero_blocks_when_cap_is_zero():
+    """tob_size=2 with max_tob_participation=0.25 produces tob_cap=0 and blocks entry."""
+    cfg = GateConfig(max_tob_participation=0.25, min_tob_size=1)
+    check = check_legs([leg(qty=5, bid_size=2, ask_size=2)], AS_OF, cfg)
+    assert check.capped_qty == 0
+    assert any("TOB_PARTICIPATION_ZERO" in r for r in check.reasons)
+
+
+def test_oi_participation_zero_blocks_when_cap_is_zero():
+    """open_interest=5 with max_oi_participation=0.10 produces oi_cap=0 and blocks entry."""
+    cfg = GateConfig(max_oi_participation=0.10)
+    check = check_legs([leg(qty=5, open_interest=5)], AS_OF, cfg)
+    assert check.capped_qty == 0
+    assert any("OI_PARTICIPATION_ZERO" in r for r in check.reasons)
+
+
 def test_no_legs_means_nothing_to_trade():
     check = check_legs([], AS_OF, CFG)
     assert (check.capped_qty, check.max_expiry) == (0, AS_OF)
@@ -259,7 +305,29 @@ def test_es_budget_exhausted(current):
     assert check.reasons == [f"SLEEVE_ES99_BUDGET_EXHAUSTED(cur=${current:.0f}+$300>$1000)"]
 
 
-def test_zero_incremental_tail_risk_is_not_capped():
+def test_zero_incremental_tail_risk_is_rejected():
+    """Zero or negative incremental ES99 is fail-closed with INVALID_INCREMENTAL_ES99."""
     check = es_budget_check(400.0, 0.0, 5, CFG)
-    assert (check.capped_qty, check.reasons, check.warnings) == (5, [], [])
-    assert check.projected_es99_usd == pytest.approx(400.0)
+    assert (check.capped_qty, check.reasons) == (0, ["INVALID_INCREMENTAL_ES99"])
+
+    check = es_budget_check(400.0, -1.0, 5, CFG)
+    assert (check.capped_qty, check.reasons) == (0, ["INVALID_INCREMENTAL_ES99"])
+
+    check = es_budget_check(400.0, float("nan"), 5, CFG)
+    assert (check.capped_qty, check.reasons) == (0, ["INVALID_INCREMENTAL_ES99"])
+def test_daemon_invalid_timestamp():
+    """Far-future evaluated_at_ns (age < -5 sec) -> RISK_DAEMON_INVALID_TIMESTAMP."""
+    reason = daemon_block_reason("0", {"evaluated_at_ns": NOW_NS + 10 * 1_000_000_000}, NOW_NS, 30.0)
+    assert reason == "RISK_DAEMON_INVALID_TIMESTAMP"
+
+
+def test_futures_check_on_non_index_etf_returns_clean():
+    """futures_check(is_index_etf=False) returns ([], []) without warnings."""
+    reasons, warnings = futures_check({}, NOW_NS, CFG, is_index_etf=False)
+    assert (reasons, warnings) == ([], [])
+
+
+def test_futures_check_on_index_etf_behaves_normally():
+    """futures_check(is_index_etf=True, default) still emits FUTURES_CROSS_CHECK_UNAVAILABLE as warning."""
+    reasons, warnings = futures_check({}, NOW_NS, CFG, is_index_etf=True)
+    assert warnings == ["FUTURES_CROSS_CHECK_UNAVAILABLE"]

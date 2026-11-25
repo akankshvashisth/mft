@@ -5,6 +5,7 @@ their order stable because the strategy and dashboard display them.
 """
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -32,7 +33,10 @@ def daemon_block_reason(
     now_ns: int,
     max_status_age_secs: float,
 ) -> str | None:
-    """Fail-closed daemon check: requires halted == "0" and a recent, non-halted evaluation."""
+    """Fail-closed daemon check: requires halted == "0" and a recent, non-halted evaluation.
+
+    Rejects far-future ``evaluated_at_ns`` (age_secs < -5.0) as ``RISK_DAEMON_INVALID_TIMESTAMP``.
+    """
     if halted_text is None or halted_text.strip() != "0":
         return "RISK_DAEMON_HALTED_OR_MISSING"
     status = status or {}
@@ -40,6 +44,8 @@ def daemon_block_reason(
     if not is_number(evaluated_ns):
         return "RISK_DAEMON_HALTED_OR_MISSING"
     age_secs = (now_ns - float(evaluated_ns)) / NS_PER_SEC
+    if age_secs < -5.0:
+        return "RISK_DAEMON_INVALID_TIMESTAMP"
     if age_secs > max_status_age_secs:
         return f"RISK_DAEMON_STALE({age_secs:.0f}s)"
     if status.get("halted") is not False:
@@ -75,8 +81,14 @@ def metrics_reasons(metrics: Payload, now_ns: int, max_age_secs: float) -> list[
     return []
 
 
-def futures_check(futures: Payload, now_ns: int, cfg: GateConfig) -> tuple[list[str], list[str]]:
-    """(reasons, warnings). Futures context is advisory: only a valid, fresh cross-check can block."""
+def futures_check(futures: Payload, now_ns: int, cfg: GateConfig, is_index_etf: bool = True) -> tuple[list[str], list[str]]:
+    """(reasons, warnings). Futures context is advisory: only a valid, fresh cross-check can block.
+
+    When ``is_index_etf`` is ``False`` (e.g. single-name mid-caps without listed futures),
+    the check returns ``([], [])`` cleanly without spamming ``FUTURES_CROSS_CHECK_UNAVAILABLE``.
+    """
+    if not is_index_etf:
+        return [], []
     diff_bps = futures.get("parity_vs_fut_diff_bps")
     if snapshot_is_fresh(futures, now_ns, cfg.max_input_age_secs) and futures.get("cross_check_valid") and is_number(diff_bps):
         if abs(float(diff_bps)) > cfg.max_parity_fut_diff_bps:
@@ -98,6 +110,9 @@ def portfolio_reasons(portfolio: Payload, now_ns: int, max_age_secs: float) -> l
         return ["PORTFOLIO_RISK_MISSING_OR_STALE"]
     if _book_es99_or_none(portfolio) is None:
         return ["PORTFOLIO_RISK_INVALID"]
+    risk = portfolio.get("risk")
+    if isinstance(risk, dict) and risk.get("has_unmodeled_positions"):
+        return ["PORTFOLIO_HAS_UNMODELED_POSITIONS"]
     return []
 
 
@@ -178,16 +193,32 @@ def check_legs(legs: Sequence[CandidateLegSpec], as_of: date, cfg: GateConfig) -
                 out.reasons.append(
                     f"LOW_OPEN_INTEREST({leg.instrument_id}: OI={leg.open_interest}<{cfg.min_open_interest})"
                 )
-            oi_cap = max(1, int(leg.open_interest * cfg.max_oi_participation))
-            if oi_cap < out.capped_qty:
+            oi_cap = int(leg.open_interest * cfg.max_oi_participation)
+            if oi_cap < 1:
+                out.reasons.append(f"OI_PARTICIPATION_ZERO({leg.instrument_id})")
+                out.capped_qty = 0
+            elif oi_cap < out.capped_qty:
                 out.capped_qty = oi_cap
                 out.warnings.append(f"QTY_CAPPED_BY_OI({leg.instrument_id}: {oi_cap})")
 
         tob_size = leg.bid_size if leg.side == "SELL" else leg.ask_size
-        tob_cap = max(1, int(tob_size * cfg.max_tob_participation))
-        if tob_cap < out.capped_qty:
-            out.capped_qty = tob_cap
-            out.warnings.append(f"QTY_CAPPED_BY_TOB({leg.instrument_id}: {tob_cap})")
+        if tob_size is None:
+            if cfg.allow_unknown_tob_size:
+                out.warnings.append(f"TOB_SIZE_UNKNOWN({leg.instrument_id})")
+            else:
+                out.reasons.append(f"TOB_SIZE_UNKNOWN({leg.instrument_id})")
+        else:
+            if tob_size < cfg.min_tob_size:
+                out.reasons.append(
+                    f"LOW_TOB_SIZE({leg.instrument_id}: size={tob_size}<{cfg.min_tob_size})"
+                )
+            tob_cap = int(tob_size * cfg.max_tob_participation)
+            if tob_cap < 1:
+                out.reasons.append(f"TOB_PARTICIPATION_ZERO({leg.instrument_id})")
+                out.capped_qty = 0
+            elif tob_cap < out.capped_qty:
+                out.capped_qty = tob_cap
+                out.warnings.append(f"QTY_CAPPED_BY_TOB({leg.instrument_id}: {tob_cap})")
 
         if leg.right == "C" and leg.side == "SELL":
             out.has_short_call = True
@@ -217,14 +248,18 @@ def es_budget_check(
     max_es99_usd = cfg.sleeve_equity_usd * cfg.max_book_es99_pct
     remaining_es99 = max(0.0, max_es99_usd - current_es99_usd)
 
-    if incremental_es99_per_lot_usd > 0.0:
-        es_qty_cap = int(remaining_es99 // incremental_es99_per_lot_usd)
-        if es_qty_cap <= 0:
-            reasons.append(
-                f"SLEEVE_ES99_BUDGET_EXHAUSTED(cur=${current_es99_usd:.0f}+${incremental_es99_per_lot_usd:.0f}"
-                f">${max_es99_usd:.0f})"
-            )
-        elif es_qty_cap < capped_qty:
+    # Fail-closed: invalid (zero, negative, non-finite) incremental ES99 blocks entry
+    if not math.isfinite(incremental_es99_per_lot_usd) or incremental_es99_per_lot_usd <= 0.0:
+        reasons.append("INVALID_INCREMENTAL_ES99")
+        return EsBudgetCheck(capped_qty=0, reasons=reasons, warnings=warnings, projected_es99_usd=current_es99_usd)
+
+    es_qty_cap = int(remaining_es99 // incremental_es99_per_lot_usd)
+    if es_qty_cap <= 0:
+        reasons.append(
+            f"SLEEVE_ES99_BUDGET_EXHAUSTED(cur=${current_es99_usd:.0f}+${incremental_es99_per_lot_usd:.0f}"
+            f">${max_es99_usd:.0f})"
+        )
+    elif es_qty_cap < capped_qty:
             capped_qty = es_qty_cap
             warnings.append(f"QTY_CAPPED_BY_ES99({es_qty_cap} lots)")
 

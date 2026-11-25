@@ -21,11 +21,10 @@ from src.scanner.verticals import VerticalPair, adjacent_verticals, split_by_rig
 ENTRY = "ENTRY"
 EXIT = "EXIT"
 STRATEGY_MIN_CREDIT = 0.05
-DEFAULT_TOB_SIZE = 10
 POSITION_TOLERANCE = 1e-6
 
 Trade = dict[str, Any]
-StrategyQuote = tuple[float, float, int, int]   # bid, ask, bid size, ask size
+StrategyQuote = tuple[float, float, int | None, int | None]   # bid, ask, bid size, ask size
 
 
 # --- Spread book -----------------------------------------------------------------------------------
@@ -130,8 +129,29 @@ def exit_reason(
     return None
 
 
-def leg_mismatches(expected: Mapping[str, float], net_position_qty: Callable[[str], float]) -> set[str]:
-    """Option legs whose open position differs from what the book implies."""
+def leg_mismatches(book: "SpreadBook", net_position_qty: Callable[[str], float]) -> set[str]:
+    """Option legs whose open position differs from what the book implies.
+
+    First excludes any trade that is already confirmed at the spread level (the broker
+    holds it as a single spread position), then checks the remaining (unconfirmed) trades'
+    leg-level positions.  This prevents overlapping strikes from falsely blocking exits.
+    """
+    # Partition trades into spread-confirmed vs. leg-level-only
+    spread_confirmed: set[str] = set()
+    unconfirmed_trades: dict[str, Trade] = {}
+    for key, trade in book.trades.items():
+        if abs(net_position_qty(key) + float(trade.get("open_lots", 0.0))) < POSITION_TOLERANCE:
+            spread_confirmed.add(key)
+        else:
+            unconfirmed_trades[key] = trade
+
+    # Compute expected leg positions only from unconfirmed trades
+    expected: dict[str, float] = {}
+    for trade in unconfirmed_trades.values():
+        for leg in trade["legs"]:
+            leg_id = str(leg["instrument_id"])
+            expected[leg_id] = expected.get(leg_id, 0.0) - float(trade["open_lots"]) * int(leg["ratio"])
+
     return {
         leg_id
         for leg_id, qty in expected.items()
@@ -240,7 +260,13 @@ def enrich_surface_legs(
             continue
         bid = float(raw.get("bid") or 0.0)
         ask = float(raw.get("ask") or 0.0)
-        bid_size = ask_size = DEFAULT_TOB_SIZE
+        # Read surface snapshot bid_size/ask_size if present, otherwise None
+        bid_size: int | None = raw.get("bid_size")
+        if bid_size is not None:
+            bid_size = int(bid_size)
+        ask_size: int | None = raw.get("ask_size")
+        if ask_size is not None:
+            ask_size = int(ask_size)
 
         own = strategy_quote(instrument_id)
         if own is not None:
@@ -251,8 +277,8 @@ def enrich_surface_legs(
             cached = cache_quote(instrument_id)
             if cached is not None and cached.mid is not None:
                 bid, ask = cached.bid, cached.ask
-                bid_size = int(cached.bid_size or DEFAULT_TOB_SIZE)
-                ask_size = int(cached.ask_size or DEFAULT_TOB_SIZE)
+                bid_size = int(cached.bid_size) if cached.bid_size is not None else None
+                ask_size = int(cached.ask_size) if cached.ask_size is not None else None
 
         mid = two_sided_mid(bid, ask)
         if mid is None:

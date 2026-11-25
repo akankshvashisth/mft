@@ -6,6 +6,7 @@ from src.quant.risk_measures import (
     TailMetrics,
     contracts_for_tail_budget,
     parametric_book_var_es,
+    portfolio_horizon_var_es,
     tail_loss_per_lot,
     tail_metrics,
 )
@@ -111,3 +112,43 @@ def test_parametric_var_es_rejects_invalid_numeric_inputs(kwargs):
     with pytest.raises(ValueError):
         rv_annual = kwargs.pop("rv_annual", 0.15)
         parametric_book_var_es(250.0, 40.0, 700.0, rv_annual, **kwargs)
+
+
+# --- Portfolio horizon VaR/ES --------------------------------------------------------------------
+
+
+def test_portfolio_horizon_var_es_empty_returns_zero():
+    """Empty legs_spec returns (0, 0)."""
+    var, es = portfolio_horizon_var_es([])
+    assert (var, es) == (0.0, 0.0)
+
+
+def test_portfolio_horizon_var_es_linear_leg_is_positive():
+    """A single long 100-share position produces positive VaR and ES at 14 days."""
+    legs = [
+        {"is_option": False, "signed_qty": 100.0, "multiplier": 1.0, "spot": 700.0},
+    ]
+    var, es = portfolio_horizon_var_es(legs, n_scenarios=2_000, seed=42)
+    assert var > 0.0
+    assert es >= var  # ES >= VaR
+
+
+def test_portfolio_horizon_var_es_option_leg_produces_tail_risk():
+    """A short put (or any option) produces meaningful tail risk with VaR < ES."""
+    legs = [
+        {
+            "is_option": True,
+            "signed_qty": -1.0,
+            "multiplier": 100.0,
+            "spot": 700.0,
+            "strike": 690.0,
+            "ttm": 0.066,  # ~24 days
+            "q": 0.0,
+            "iv": 0.20,
+            "is_call": False,
+            "theo_price": 5.0,
+        },
+    ]
+    var, es = portfolio_horizon_var_es(legs, n_scenarios=2_000, seed=42)
+    assert var > 0.0
+    assert es >= var

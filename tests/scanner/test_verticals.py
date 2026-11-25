@@ -91,3 +91,44 @@ def test_vertical_combo_fields():
     assert (combo.net_credit, combo.max_width) == (0.4, 5.0)
     assert combo.theo_edge_per_share == pytest.approx(0.01)
     assert combo.avg_edge_to_half_spread == pytest.approx(0.2)
+def test_delta_targeted_verticals_filters_by_width_and_delta():
+    """$1-spaced adjacent puts on a $40 mid-cap skip $1/2-wide pairs; need >= $2.50."""
+    from src.scanner.verticals import delta_targeted_verticals
+
+    puts = [
+        surface_leg("P36", 36.0, "P", 0.1, 0.3),
+        surface_leg("P37", 37.0, "P", 0.2, 0.4),
+        surface_leg("P38", 38.0, "P", 0.3, 0.5),
+        surface_leg("P40", 40.0, "P", 0.5, 0.7),  # ATM — not OTM
+        surface_leg("P41", 41.0, "P", 0.6, 0.8),  # ITM — not OTM
+    ]
+    # OTM puts at P36-P38. Widths: (37,36)=1, (38,37)=1, (38,36)=2. All < $2.50.
+    pairs = delta_targeted_verticals(puts, [], spot=40.0, min_width_usd=2.50,
+                                     short_delta_range=(0.15, 0.30),
+                                     min_width_pct_spot=0.04, max_width_pct_spot=0.12)
+    assert len(pairs) == 0, f"Expected no pairs (all widths < $2.50), got {len(pairs)}"
+
+    # With adjacent_verticals and only OTM put (P36-P38), $1-wide pairs still appear
+    from src.scanner.verticals import adjacent_verticals
+    adjacent = adjacent_verticals(puts[:3], [], min_mid_credit=0.0)
+    assert len(adjacent) > 0  # $1-wide pairs exist
+
+
+def test_delta_targeted_otm_puts_only():
+    """ITM puts (strike > spot) are never selected by delta_targeted_verticals."""
+    from src.scanner.verticals import delta_targeted_verticals
+
+    # P34 ($34, OTM) and P37 ($37, OTM) at spot=40
+    # Add P43 ($43, ITM — strike > 40) to verify it's excluded as short leg
+    puts = [
+        surface_leg("P34", 34.0, "P", 0.6, 0.8),
+        surface_leg("P37", 37.0, "P", 0.7, 0.9),
+        surface_leg("P43", 43.0, "P", 0.9, 1.1),
+    ]
+    pairs = delta_targeted_verticals(puts, [], spot=40.0, min_width_usd=2.50,
+                                     short_delta_range=(0.0, 1.0),  # Wide delta range for testing
+                                     min_width_pct_spot=0.0, max_width_pct_spot=0.30)
+    # P43 has strike=43 > spot=40 → rejected as short leg. P34' short=37 or 34 are OTM → kept
+    short_strikes = [p.short["strike"] for p in pairs]
+    assert 43.0 not in short_strikes, "ITM put P43 should not appear as short leg"
+    assert len(pairs) >= 1, "OTM pairs should be selected"

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -14,12 +15,14 @@ from datetime import date
 from typing import Any, Protocol
 
 from src.common import keys
-from src.common.constants import DEFAULT_VALKEY_URL
+from src.common.constants import DEFAULT_VALKEY_URL, SECS_PER_DAY
 from src.common.log import LogLike
 from src.common.market import OptionSpec, QuoteObs, symbol_of
+from src.common.numeric import is_number
 from src.common.quotes import combo_mid_natural
 from src.common.store import JsonStore
 from src.execution.passive_combo import CREDIT_OPEN, DEBIT_CLOSE, ChildClipOrder, PassiveComboExecutor
+from src.risk.gate_rules import snapshot_is_fresh
 from src.strategies.vrp_core import (
     ENTRY,
     EXIT,
@@ -93,6 +96,13 @@ class OrderGateway(Protocol):
 
     def order_view(self, order_key: str) -> OrderView | None: ...
 
+    def open_order_keys(self) -> list[str]:
+        """All client order keys of pre-existing open orders (for crash restart reconciliation)."""
+        return []
+
+    def release(self, order_key: str) -> None:
+        """Prunes a finalized order key from internal bookkeeping (e.g. _client_ids)."""
+
 
 class MarketView(Protocol):
     def cache_quote(self, instrument_id: str) -> QuoteObs | None: ...
@@ -159,7 +169,7 @@ class VrpEngine:
         self.clock_ns = clock_ns
         self.monotonic = monotonic
 
-        self.quotes: dict[str, tuple[float, float, int, int]] = {}
+        self.quotes: dict[str, tuple[float, float, int | None, int | None]] = {}
         self.spot_mid: float = 0.0
         self.book = SpreadBook()
         self.working: dict[str, WorkingOrder] = {}
@@ -168,14 +178,43 @@ class VrpEngine:
         self._last_fill_wall_ns: int = 0
         self._risk_check_mono: float = float("-inf")
         self._risk_block_reason: str | None = None
+        self._rv_block_reason: str | None = None
+        self._reconciliation_mismatch: bool = False
+        self._not_confirmed_count: dict[str, int] = {}
+        self._last_rv_20d: float | None = None
 
     # --- Lifecycle -------------------------------------------------------------------------------
 
     def start(self) -> int:
-        """Subscribes to the configured options, restores the persisted book; returns open spreads."""
+        """Subscribes to the configured options, restores the persisted book; returns open spreads.
+
+        On startup:
+        1. Cancels any pre-existing open orders (orphaned DAY orders after a crash).
+        2. Reconciles the persisted book against broker positions.
+        """
         for option_id in self.settings.option_ids:
             self.market.ensure_subscribed(str(option_id))
         self.book = SpreadBook.from_json(self.store.get_json(self.book_key))
+
+        # Cancel orphaned open orders from a previous run
+        for orphan_key in self.gateway.open_order_keys():
+            self.gateway.cancel(orphan_key)
+            self.log.warning(f"Cancelled orphaned DAY order {orphan_key} on startup")
+
+        # Reconcile book trades against broker positions
+        self._reconciliation_mismatch = False
+        if self.settings.paper_routing_enabled:
+            net_qty = self.market.net_position_qty
+            mismatches = leg_mismatches(self.book, net_qty)
+            for key, trade in list(self.book.trades.items()):
+                if exit_confirmed(key, trade, mismatches, net_qty):
+                    continue
+                self._reconciliation_mismatch = True
+                self.log.warning(
+                    f"BOOK_RECONCILIATION_MISMATCH: trade {key} ({trade.get('combo')}) "
+                    f"open_lots={trade.get('open_lots')} has no matching broker position"
+                )
+
         for trade in self.book.trades.values():
             self._ensure_leg_subscriptions(trade["legs"])
         return len(self.book)
@@ -208,8 +247,8 @@ class VrpEngine:
             self.quotes[quote.instrument_id] = (
                 quote.bid,
                 quote.ask,
-                int(quote.bid_size or 10),
-                int(quote.ask_size or 10),
+                int(quote.bid_size) if quote.bid_size is not None else None,
+                int(quote.ask_size) if quote.ask_size is not None else None,
             )
 
     def leg_quote(self, instrument_id: str) -> tuple[float, float] | None:
@@ -278,6 +317,7 @@ class VrpEngine:
         else:
             self.executor.mark_clip_status(wo.clip_id, status)
         self.executor.discard_clip(wo.clip_id)
+        self.gateway.release(order_key)
 
     def _register_spread_legs(self, spread_id: str, legs: list[dict]) -> None:
         if spread_id in self._registered_spreads:
@@ -361,9 +401,13 @@ class VrpEngine:
                 continue
             mid, natural = prices
             if mid <= 0.0:
-                self.log.warning(f"Cancelling {key} ({wo.combo}): spread mid {mid:.2f} is no longer positive")
-                self._cancel(key, wo, "CANCELLED_INVALID_MID")
-                continue
+                if wo.purpose == ENTRY:
+                    self.log.warning(f"Cancelling {key} ({wo.combo}): spread mid {mid:.2f} is no longer positive")
+                    self._cancel(key, wo, "CANCELLED_INVALID_MID")
+                    continue
+                # EXIT orders: clamp so winning spreads can still close cleanly
+                mid = max(mid, 0.05)
+                natural = max(natural, mid)
 
             actions = self.executor.on_market_tick(
                 underlying=underlying,
@@ -371,6 +415,7 @@ class VrpEngine:
                 new_mid_price=mid,
                 new_natural_price=natural,
                 parent_order_id=wo.parent_id,
+                rv_20d=self._last_rv_20d,
             )
             for act in actions:
                 if act["action"] == "MODIFY_LIMIT" and self.gateway.modify_price(key, act["new_limit"]):
@@ -388,7 +433,7 @@ class VrpEngine:
         s = self.settings
         working_spreads = {wo.spread_key for wo in self.working.values()}
         net_qty = self.market.net_position_qty
-        mismatches = leg_mismatches(self.book.expected_leg_positions(), net_qty) if s.paper_routing_enabled else set()
+        mismatches = leg_mismatches(self.book, net_qty) if s.paper_routing_enabled else set()
         book_changed = False
 
         for key, trade in list(self.book.trades.items()):
@@ -422,6 +467,12 @@ class VrpEngine:
             elif not exit_confirmed(key, trade, mismatches, net_qty):
                 # Buying back a spread we may not hold would open the opposite position
                 signal["status"] = "POSITION_NOT_CONFIRMED_IN_CACHE"
+                self._not_confirmed_count[key] = self._not_confirmed_count.get(key, 0) + 1
+                if self._not_confirmed_count[key] >= 2:
+                    self.log.error(
+                        f"Book reconciliation alert for {key} ({trade.get('combo')}): "
+                        f"not confirmed {self._not_confirmed_count[key]} cycles"
+                    )
             else:
                 clip = self.executor.create_parent_plan(
                     underlying=str(s.underlying_id),
@@ -481,6 +532,10 @@ class VrpEngine:
         return candidate_row(cand, risk, decision, dte, per_lot_es99, per_lot_ev), cand, decision
 
     def current_entry_block_reason(self) -> str | None:
+        if self._rv_block_reason is not None:
+            return self._rv_block_reason
+        if self._reconciliation_mismatch:
+            return "BOOK_RECONCILIATION_MISMATCH"
         portfolio_ts_ns = 0
         if self._last_fill_wall_ns:
             portfolio_ts_ns = int(self.store.get_json(keys.PORTFOLIO_RISK).get("ts_ns") or 0)
@@ -549,17 +604,36 @@ class VrpEngine:
         underlying = str(s.underlying_id)
         surf = self.store.get_json(keys.surface_key(underlying))
         rv_snap = self.store.get_json(keys.rv_key(underlying))
-        rv_20d = float(rv_snap.get("rv_20d") or 0.25)
+        rv_20d: float | None = None
+        self._rv_block_reason = None
+
+        # Validate RV freshness and finiteness — fail closed
+        if snapshot_is_fresh(rv_snap, wall_ns, SECS_PER_DAY):
+            raw_rv = rv_snap.get("rv_20d") if isinstance(rv_snap, dict) else None
+            if is_number(raw_rv) and math.isfinite(float(raw_rv)) and float(raw_rv) > 0.0:
+                rv_20d = float(raw_rv)
+                self._last_rv_20d = rv_20d
+            else:
+                self._rv_block_reason = "RV_MISSING_OR_INVALID"
+        else:
+            self._rv_block_reason = "RV_MISSING_OR_INVALID"
+
         spot = self.spot_mid or float(surf.get("spot") or 0.0)
 
         self.manage_working_orders()
         exit_signals = self.evaluate_exits(today)
 
-        evaluated = [self.evaluate_candidate(cand, rv_20d, spot, today) for cand in self.candidates(surf, today)]
-        evaluated.sort(key=lambda e: rank_key(e[0]), reverse=True)
-        rows = [e[0] for e in evaluated]
-        top_row = rows[0] if rows else None
-        best = evaluated[0] if evaluated and evaluated[0][0]["gate_approved"] else None
+        if rv_20d is not None:
+            evaluated = [self.evaluate_candidate(cand, rv_20d, spot, today) for cand in self.candidates(surf, today)]
+            evaluated.sort(key=lambda e: rank_key(e[0]), reverse=True)
+            rows = [e[0] for e in evaluated]
+            top_row = rows[0] if rows else None
+            best = evaluated[0] if evaluated and evaluated[0][0]["gate_approved"] else None
+        else:
+            evaluated = []
+            rows = []
+            top_row = None
+            best = None
 
         block_reason = self.current_entry_block_reason()
         outcome = self._enter(best, spot, block_reason)
@@ -570,7 +644,7 @@ class VrpEngine:
             "entry_block_reason": block_reason,
             "underlying": underlying,
             "spot": round(spot, 2),
-            "rv_20d": round(rv_20d, 4),
+            "rv_20d": round(rv_20d, 4) if rv_20d is not None else None,
             "candidates_scanned": len(rows),
             "top_candidate": top_row,
             "all_candidates": rows[:MAX_CANDIDATE_ROWS],
@@ -579,6 +653,7 @@ class VrpEngine:
             "working_orders": self.working_rows(),
             "open_book": self.book.rows(),
             "exit_signals": exit_signals,
+            "book_reconciliation_alert": any(c >= 2 for c in self._not_confirmed_count.values()),
             "ts_ns": wall_ns,
             "event_ts_ns": event_ts_ns,
         }

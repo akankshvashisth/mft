@@ -184,6 +184,12 @@ class FakeOrderGateway:
         base.update(fields)
         self.views[order_key] = OrderView(**base)
 
+    def open_order_keys(self) -> list[str]:
+        return [k for k, v in self.views.items() if v.is_open]
+
+    def release(self, order_key: str) -> None:
+        pass
+
 
 class FakeMarket:
     """MarketView stand-in: cache quotes, option specs, net positions and subscriptions."""
@@ -317,3 +323,7 @@ class FakeStrategyPorts(FakeActorPorts):
 
     def cancel(self, order: Any) -> None:
         self.cancelled.append(order)
+
+    def orders_open(self) -> list[Any]:
+        """All open orders that are in the orders dict and have is_open == True."""
+        return [o for o in self.orders.values() if getattr(o, "is_open", True)]

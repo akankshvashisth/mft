@@ -141,6 +141,48 @@ def test_positions_snapshot_can_be_optional():
     cfg = RiskDaemonConfig(require_positions_snapshot=False)
     assert not evaluate_risk(inputs(positions=None), cfg, NOW_NS).halted
 
+def test_account_missing_when_required():
+    """require_account_snapshot=True with no account -> missing_account_snapshot."""
+    cfg = RiskDaemonConfig(require_account_snapshot=True)
+    ev = evaluate_risk(inputs(account=None), cfg, NOW_NS)
+    assert ev.halted
+    assert "missing_account_snapshot" in ev.reason_codes
+
+
+def test_account_pm_nlv_buffer_breach():
+    """account nlv_usd below min_pm_nlv_usd -> pm_nlv_buffer_breach."""
+    cfg = RiskDaemonConfig(min_pm_nlv_usd=105_000.0)
+    acct = {"nlv_usd": 102_000.0, "cushion": 0.50, "ts_ns": NOW_NS}
+    ev = evaluate_risk(inputs(account=acct), cfg, NOW_NS)
+    assert ev.halted
+    assert any("pm_nlv_buffer_breach" in r for r in ev.reason_codes)
+
+
+def test_account_margin_cushion_breach():
+    """account cushion below min_margin_cushion -> margin_cushion_breach."""
+    cfg = RiskDaemonConfig(min_margin_cushion=0.25)
+    acct = {"nlv_usd": 200_000.0, "cushion": 0.18, "ts_ns": NOW_NS}
+    ev = evaluate_risk(inputs(account=acct), cfg, NOW_NS)
+    assert ev.halted
+    assert any("margin_cushion_breach" in r for r in ev.reason_codes)
+
+
+def test_healthy_account_does_not_halt():
+    """Fresh account with sufficient NLV and cushion -> no account-related halt."""
+    cfg = RiskDaemonConfig(require_account_snapshot=True, min_pm_nlv_usd=105_000.0, min_margin_cushion=0.25)
+    acct = {"nlv_usd": 200_000.0, "cushion": 0.50, "ts_ns": NOW_NS}
+    ev = evaluate_risk(inputs(account=acct), cfg, NOW_NS)
+    assert not any("pm_nlv" in r or "margin_cushion" in r or "account" in r for r in ev.reason_codes)
+
+
+def test_account_non_numeric_values_fail_closed():
+    """account with non-numeric nlv_usd -> invalid_pm_nlv; non-numeric cushion -> invalid_margin_cushion."""
+    acct = {"nlv_usd": "N/A", "cushion": "unknown", "ts_ns": NOW_NS}
+    ev = evaluate_risk(inputs(account=acct), RiskDaemonConfig(), NOW_NS)
+    assert ev.halted
+    codes = ev.reason_codes
+    assert any("invalid_pm_nlv" in c for c in codes)
+    assert any("invalid_margin_cushion" in c for c in codes)
 
 def test_reasons_follow_check_order():
     ev = evaluate_risk(

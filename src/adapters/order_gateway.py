@@ -128,6 +128,23 @@ class NautilusOrderGateway:
         if order is not None:
             self.ports.cancel(order)
 
+    def open_order_keys(self) -> list[str]:
+        """Returns keys of all pre-existing open DAY orders (for crash restart reconciliation).
+
+        Queries ``self.ports.orders_open()``, registers each found order's ``client_order_id``
+        into ``self._client_ids`` so ``cancel(key)`` works, and returns their string keys.
+        """
+        keys: list[str] = []
+        for order in self.ports.orders_open():
+            cid = str(order.client_order_id)
+            self._client_ids[cid] = order.client_order_id
+            keys.append(cid)
+        return keys
+
+    def release(self, order_key: str) -> None:
+        """Prunes a finalized order key from _client_ids."""
+        self._client_ids.pop(order_key, None)
+
 
 class NautilusMarketView:
     """Cache quotes, option metadata, net positions and on-demand quote subscriptions."""

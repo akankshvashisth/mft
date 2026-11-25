@@ -54,7 +54,7 @@ class PortfolioAnalyticsActor(DataActor):
         self.ports.set_timer("portfolio_analytics_eval", s.interval_secs, self.on_timer)
         self.ports.info(
             f"PortfolioAnalyticsActor started (benchmark={s.benchmark_id}, "
-            f"sleeve=${s.allocated_capital_usd:,.0f}, realized_carry=${self.core.sleeve.realized_carry_usd:,.2f}, "
+            f"sleeve=${s.allocated_capital_usd:,.0f}, realized_carry=${self.core.sleeve.prior_carry_usd:,.2f}, "
             f"hwm=${self.core.sleeve.high_water_mark:,.2f})"
         )
 

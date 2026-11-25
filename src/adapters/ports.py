@@ -90,6 +90,10 @@ class StrategyPorts(ActorPorts):
     def cancel(self, order: Any) -> None:
         self._component.cancel_order(order)
 
+    def orders_open(self) -> list[Any]:
+        """All open orders for this strategy (used for crash restart reconciliation)."""
+        return list(self._component.cache.orders_open(strategy_id=self._component.id))
+
 
 class PortsLog:
     """LogLike that forwards to `owner.ports` at call time, so swapping the ports also redirects logs."""

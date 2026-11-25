@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from statistics import fmean
 from typing import Any
 
+from src.common.constants import DEFAULT_RISK_FREE_RATE
 from src.scanner.combos import CandidateCombo, CandidateLeg
 
 Row = Mapping[str, Any]
@@ -70,6 +71,104 @@ def adjacent_verticals(
             pairs.append(pair)
     return pairs
 
+def delta_targeted_verticals(
+    puts: Sequence[Row],
+    calls: Sequence[Row],
+    spot: float,
+    *,
+    short_delta_range: tuple[float, float] = (0.15, 0.30),
+    min_width_usd: float = 2.50,
+    min_width_pct_spot: float = 0.04,
+    max_width_pct_spot: float = 0.12,
+    min_mid_credit: float = 0.0,
+    max_width: float = MAX_VERTICAL_WIDTH,
+    ttm_days: float = 30.0,
+    risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
+    dividend_yield: float = 0.0,
+    default_iv: float = 0.35,
+) -> list[VerticalPair]:
+    """Delta-targeted vertical spreads using BSM |delta| filtering.
+
+    Unlike ``adjacent_verticals`` which only pairs consecutive strikes, this function considers all
+    (short_i, long_j) pairs for i > j.  The short leg must be OTM (``short_strike < spot`` for puts,
+    ``short_strike > spot`` for calls) and have its absolute Black-Scholes delta inside
+    ``short_delta_range``.  Strike width must be within ``[min_width_usd, max_width]`` and also satisfy
+    ``min_width_pct_spot`` / ``max_width_pct_spot`` so $1-wide spreads on $35 mid-caps are excluded.
+
+    ``ttm_days``, ``risk_free_rate`` and ``dividend_yield`` are used for the BSM delta calculation
+    (used only when the leg row lacks a ``"delta"`` key).  ``default_iv`` supplies the at-the-money IV
+    when neither ``svi_iv`` nor ``raw_iv`` is present on the leg row.
+
+    Returns empty list when no pair satisfies all constraints or when ``spot <= 0.0``.
+    """
+    from src.quant.black_scholes import bs_greeks
+
+    if spot <= 0.0:
+        return []
+    pairs: list[VerticalPair] = []
+
+    def _short_abs_delta(row: Row, is_call: bool) -> float | None:
+        """Black-Scholes |delta| from the row, or None if it cannot be computed."""
+        raw = row.get("delta")
+        if raw is not None:
+            try:
+                return abs(float(raw))
+            except (TypeError, ValueError):
+                pass
+        iv = float(row.get("svi_iv") or row.get("raw_iv") or default_iv)
+        ttm = max(ttm_days / 365.25, 1e-4)
+        g = bs_greeks(spot, float(row["strike"]), ttm, risk_free_rate, dividend_yield, iv, is_call)
+        return abs(g["delta"])
+
+    # Bull put spreads: short strike < spot (OTM put)
+    for i in range(1, len(puts)):
+        for j in range(0, i):
+            short, wing = puts[i], puts[j]
+            short_strike = float(short["strike"])
+            if short_strike >= spot:  # Must be OTM
+                continue
+            width = short_strike - float(wing["strike"])
+            if width <= 0 or width > max_width:
+                continue
+            width_pct = width / spot
+            if width_pct < min_width_pct_spot or width_pct > max_width_pct_spot:
+                continue
+            if width < min_width_usd:
+                continue
+            abs_delta = _short_abs_delta(short, is_call=False)
+            if abs_delta is None:
+                continue
+            if abs_delta < short_delta_range[0] or abs_delta > short_delta_range[1]:
+                continue
+            pair = _pair(BULL_PUT_SPREAD, short, wing, width, max_width, min_mid_credit)
+            if pair is not None:
+                pairs.append(pair)
+
+    # Bear call spreads: short strike > spot (OTM call)
+    for i in range(0, len(calls) - 1):
+        for j in range(i + 1, len(calls)):
+            short, wing = calls[i], calls[j]
+            short_strike = float(short["strike"])
+            if short_strike <= spot:  # Must be OTM
+                continue
+            width = float(wing["strike"]) - short_strike
+            if width <= 0 or width > max_width:
+                continue
+            width_pct = width / spot
+            if width_pct < min_width_pct_spot or width_pct > max_width_pct_spot:
+                continue
+            if width < min_width_usd:
+                continue
+            abs_delta = _short_abs_delta(short, is_call=True)
+            if abs_delta is None:
+                continue
+            if abs_delta < short_delta_range[0] or abs_delta > short_delta_range[1]:
+                continue
+            pair = _pair(BEAR_CALL_SPREAD, short, wing, width, max_width, min_mid_credit)
+            if pair is not None:
+                pairs.append(pair)
+
+    return pairs
 
 def vertical_name(symbol: str, pair: VerticalPair) -> str:
     strikes = f"{int(pair.short['strike'])}/{int(pair.long['strike'])}"

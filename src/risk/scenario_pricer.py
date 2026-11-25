@@ -16,6 +16,13 @@ PriceFn = Callable[..., np.ndarray]
 SPOT_SHOCKS = (-0.10, -0.05, -0.02, 0.0, 0.02, 0.05, 0.10)
 VOL_SHOCKS = (-0.05, 0.0, 0.05, 0.10, 0.15)
 SPOT_VOL_CORRELATION = -0.65
+STUDENT_T_DOF = 5.0
+TAIL_CORR_DOWN = 0.85
+TAIL_CORR_UP = 0.40
+BETA_LEV = 0.7
+VOL_OF_VOL_FRAC = 0.35
+SKEW_SLOPE = 0.25  # Sticky-delta skew slope: ∆σ per unit ∆ln(K/F)
+MIN_VOL = 0.03
 
 
 def fast_vollib_price(S, K, t, r, sigma, flag, q) -> np.ndarray:
@@ -34,6 +41,24 @@ def friction_usd(legs: Sequence[CandidateLeg], slippage_fraction: float, commiss
     half_spread_usd = sum(slippage_fraction * max(leg.ask - leg.bid, 0.01) * leg.qty * 100.0 for leg in legs)
     comm_usd = sum(commission_per_leg * leg.qty for leg in legs)
     return half_spread_usd + comm_usd
+
+
+def round_trip_friction_usd(
+    legs: Sequence[CandidateLeg],
+    slippage_fraction: float,
+    commission_per_leg: float,
+    exit_slippage_fraction: float | None = None,
+) -> float:
+    """Round-trip friction: entry + exit costs.
+
+    When ``exit_slippage_fraction`` is provided (same units as ``slippage_fraction``),
+    exit spread crossing is deducted separately from entry crossing, enabling asymmetric
+    friction when the spread is wider at exit (e.g. during vol spikes).
+    """
+    exit_frac = exit_slippage_fraction if exit_slippage_fraction is not None else slippage_fraction
+    entry_friction = friction_usd(legs, slippage_fraction, commission_per_leg)
+    exit_friction = friction_usd(legs, exit_frac, commission_per_leg)
+    return entry_friction + exit_friction
 
 
 def defined_risk_margin_usd(combo: CandidateCombo, grid: list[list[float]]) -> float:
@@ -72,9 +97,13 @@ class RiskAssessment:
 class ScenarioPricer:
     """Evaluates candidate option combos via P-measure Monte Carlo & 2D Spot x Vol grids.
 
-    Every evaluation draws its scenarios from a fresh default_rng(seed) (common random numbers), so
-    candidates are compared on identical paths. price_fn defaults to fast_vollib; bsm_prices (QuantLib) is a
-    drop-in alternative that the tests inject.
+    Every evaluation draws its scenarios from a deterministic local ``default_rng(seed)`` (Common Random
+    Numbers), so candidates are compared on identical paths regardless of evaluation order.
+    price_fn defaults to fast_vollib; bsm_prices (QuantLib) is a drop-in alternative that the tests inject.
+
+    Uses Student-t (:math:`\nu=5`) spot shocks with tail correlation (0.85 down / 0.40 up),
+    leverage-correlated IV shocks (β=0.7), and sticky-delta skew slide.  Friction deducts entry
+    **and** exit costs when ``horizon_days < combo.ttm_days``.
     """
 
     def __init__(
@@ -82,12 +111,14 @@ class ScenarioPricer:
         n_scenarios: int = 10_000,
         commission_per_leg: float = 0.65,
         slippage_fraction: float = 0.50,
+        exit_slippage_fraction: float | None = None,
         seed: int = 42,
         price_fn: PriceFn | None = None,
     ) -> None:
         self.n_scenarios = n_scenarios
         self.commission_per_leg = commission_per_leg
         self.slippage_fraction = slippage_fraction
+        self.exit_slippage_fraction = exit_slippage_fraction
         self.seed = seed
         self.price_fn: PriceFn = price_fn or fast_vollib_price
 
@@ -125,25 +156,50 @@ class ScenarioPricer:
         sleeve_equity_usd: float = 100_000.0,
         max_es_risk_pct: float = 0.01,
     ) -> RiskAssessment:
-        """Runs P-measure Monte Carlo EV/VaR/ES + deterministic 2D Spot x Vol stress grid."""
+        """Runs P-measure Monte Carlo EV/VaR/ES + deterministic 2D Spot x Vol stress grid.
+
+        Shock model (Student-t ν=5 with tail correlation, leverage vol shock, sticky-delta skew):
+        - Spot returns are Student-t(5) scaled to unit variance.
+        - Tail correlation: 0.85 on down moves, 0.40 on up moves.
+        - IV shock = -β * r_S + η * sqrt(dt) * Z_vol + skew_slope * ∆ln(K/F).
+        - Common Random Numbers via deterministic ``default_rng(self.seed)``.
+        - Friction: entry-only when held to expiry, else round-trip (entry + exit).
+        """
         held_days = min(horizon_days, combo.ttm_days)
         dt_years = held_days / DAYS_PER_YEAR
         rem_ttm_years = max((combo.ttm_days - held_days) / DAYS_PER_YEAR, 1e-6)
 
-        friction = self.friction_usd(combo)
+        # Round-trip friction when exiting before expiry
+        is_round_trip = held_days < combo.ttm_days
+        if is_round_trip:
+            friction = round_trip_friction_usd(
+                combo.legs, self.slippage_fraction, self.commission_per_leg, self.exit_slippage_fraction
+            )
+        else:
+            friction = self.friction_usd(combo)
         entry_credit_usd = combo.net_credit * 100.0
 
-        # P-measure correlated Spot & Vol draws (leverage effect), identical for every combo
+        # Common Random Numbers: deterministic seed per call
         rng = np.random.default_rng(self.seed)
-        rho_sv = SPOT_VOL_CORRELATION
-        draws = rng.multivariate_normal(
-            [0.0, 0.0], [[1.0, rho_sv], [rho_sv, 1.0]], size=self.n_scenarios, method="cholesky"
-        )
-        z_spot, z_vol = draws[:, 0], draws[:, 1]
+        scale_t = np.sqrt((STUDENT_T_DOF - 2.0) / STUDENT_T_DOF)  # unit-variance scaling
 
+        # Student-t 5 spot draws (scaled to unit variance by multiplying by scale_t)
+        z_spot_raw = rng.standard_t(df=STUDENT_T_DOF, size=self.n_scenarios) * scale_t
+
+        # Tail correlation: mix market and idiosyncratic components
+        z_market = z_spot_raw.copy()
+        z_idio = rng.standard_t(df=STUDENT_T_DOF, size=self.n_scenarios) * scale_t
+        rho = np.where(z_market < 0.0, TAIL_CORR_DOWN, TAIL_CORR_UP)
+        z_spot = rho * z_market + np.sqrt(1.0 - rho ** 2) * z_idio
+
+        # Leverage-correlated vol shock (matching WP-3's portfolio_horizon_var_es)
+        z_vol_raw = rng.standard_normal(size=self.n_scenarios)
+        r_S = realized_vol_p * np.sqrt(dt_years) * z_spot  # log-return
+        vol_shift_sim = -BETA_LEV * r_S + VOL_OF_VOL_FRAC * realized_vol_p * np.sqrt(dt_years) * z_vol_raw
+
+        # Exact BSM carry: drift uses risk-free rate - dividend yield
         drift = (combo.risk_free_rate - combo.dividend_yield - 0.5 * realized_vol_p ** 2) * dt_years
         spot_sim = combo.spot * np.exp(drift + realized_vol_p * np.sqrt(dt_years) * z_spot)
-        vol_shift_sim = 0.35 * realized_vol_p * np.sqrt(dt_years) * z_vol
 
         net_pnl = self._reprice_combo_vectors(combo, spot_sim, vol_shift_sim, rem_ttm_years) - friction
         tail = tail_metrics(net_pnl)

@@ -96,3 +96,22 @@ def test_market_view(ports):
     market.ensure_subscribed(P690)
     market.ensure_subscribed(P690)
     assert ports.quote_subscriptions == [P690]
+
+
+def test_open_order_keys_discovers_preexisting_orders(ports):
+    """A freshly constructed NautilusOrderGateway discovers and registers a pre-existing open order."""
+    from types import SimpleNamespace
+
+    # Inject a pre-existing open order into ports
+    preexisting = SimpleNamespace(client_order_id="O-PREEXISTING", is_open=True)
+    ports.orders_open = lambda: [preexisting]
+    ports.orders["O-PREEXISTING"] = preexisting
+    gateway = NautilusOrderGateway(ports)
+
+    keys = gateway.open_order_keys()
+    assert "O-PREEXISTING" in keys
+    # The order key is now registered in _client_ids so cancel works
+    gateway.cancel("O-PREEXISTING")
+    assert len(ports.cancelled) == 1
+    # The order object is passed to ports.cancel
+    assert ports.cancelled[0] is preexisting

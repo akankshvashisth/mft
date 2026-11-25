@@ -15,8 +15,8 @@ class CandidateLegSpec:
     qty: int
     bid: float
     ask: float
-    bid_size: int = 10
-    ask_size: int = 10
+    bid_size: int | None = None
+    ask_size: int | None = None
     open_interest: int | None = None   # None = unknown; never substitute a placeholder
     multiplier: int = 100
     is_adjusted: bool = False
@@ -33,6 +33,8 @@ class GateConfig:
     max_leg_spread_pct: float = 0.18         # Max 18% bid-ask width for mid-cap legs
     min_open_interest: int = 100             # Minimum strike OI floor
     allow_unknown_open_interest: bool = False  # Fail closed until an OI source is wired
+    min_tob_size: int = 4                    # Minimum top-of-book size for entry
+    allow_unknown_tob_size: bool = False     # Fail closed when TOB size is unknown
     max_order_rate_per_min: int = 6          # Anti-loop throttle (counts actual submissions)
     max_parity_fut_diff_bps: float = 20.0    # Max forward divergence vs CME futures
     max_svi_rmse_vol_pts: float = 0.50       # Max SVI calibration RMSE before the surface is unusable

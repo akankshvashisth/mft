@@ -14,7 +14,7 @@ from src.common.log import LogLike
 from src.common.market import OptionSpec, QuoteObs, symbol_of
 from src.common.store import JsonStore, NullStore
 from src.common.timeutil import ny_date
-from src.quant.risk_measures import parametric_book_var_es
+from src.quant.risk_measures import parametric_book_var_es, portfolio_horizon_var_es
 from src.services.portfolio_marks import (
     GREEK_KEYS,
     SPOT_SHOCKS_PCT,
@@ -53,6 +53,7 @@ class InstrumentInfo:
     kind: str                   # OPTION, OPTION_SPREAD or OTHER
     multiplier: float
     option: OptionSpec | None = None
+    spread_legs: tuple[tuple[str, int], ...] | None = None  # (instrument_id, ratio) pairs
 
 
 class BookMarket(Protocol):
@@ -132,7 +133,18 @@ class PortfolioService:
         return None
 
     def spread_option_legs(self, spread_id: str) -> list[tuple[InstrumentInfo, int]] | None:
-        """Leg (instrument, ratio) pairs registered by the strategy under mft:spread_legs:<spread id>."""
+        """Leg (instrument, ratio) pairs: prefer info.spread_legs, fall back to mft:spread_legs:<id>."""
+        # First check InstrumentInfo for embedded legs (from OptionSpread.info["legs"])
+        info = self.market.instrument(spread_id)
+        if info is not None and info.spread_legs:
+            legs: list[tuple[InstrumentInfo, int]] = []
+            for iid, ratio in info.spread_legs:
+                leg_info = self.market.instrument(iid)
+                if leg_info is None or leg_info.kind != OPTION or leg_info.option is None:
+                    return None
+                legs.append((leg_info, ratio))
+            return legs or None
+        # Fall back to Valkey-stored spread legs
         raw_legs = self.store.get_json_value(keys.spread_legs_key(spread_id))
         if not isinstance(raw_legs, list):
             return None
@@ -202,6 +214,7 @@ class PortfolioService:
         session_realized_usd = closed_realized_usd + sum(float(p.realized_pnl) for p in positions)
         legs_spec: list[dict] = []
         position_rows: list[dict] = []
+        unmodeled_positions: list[str] = []
 
         for pos in positions:
             iid = str(pos.instrument_id)
@@ -246,6 +259,7 @@ class PortfolioService:
                 mark_px = live_mid if live_mid is not None else avg_px
                 mark_source = "UNMODELED_SPREAD"
                 pos_pnl = signed_qty * info.multiplier * (mark_px - avg_px)
+                unmodeled_positions.append(iid)
             else:
                 mult = info.multiplier if info is not None else 1.0
                 mark_px = self.live_mid(iid, now_ns)
@@ -261,7 +275,7 @@ class PortfolioService:
                 pos_greeks["beta_delta"] = (
                     signed_qty * mult * mark_px / bench_spot if bench_spot > 0 else signed_qty * mult
                 )
-                legs_spec.append(linear_stress_leg(signed_qty, mult, mark_px))
+                legs_spec.append(linear_stress_leg(signed_qty, mult, mark_px, underlying=iid))
 
             unrealized_pnl_usd += pos_pnl
             for key in GREEK_KEYS:
@@ -285,7 +299,10 @@ class PortfolioService:
         net_gamma_1pct = totals["gamma_1pct"]
         net_vega_1v = totals["vega_1v"]
         net_theta_day = totals["theta_day"]
-        realized_pnl_usd = self.sleeve.realized_carry_usd + session_realized_usd
+
+        # Snapshot FIRST — Day 1 → Day 2 rollover happens inside, making prior_carry consistent
+        sleeve = self.sleeve.snapshot(session_realized_usd, unrealized_pnl_usd, len(positions), now_ns)
+        realized_pnl_usd = self.sleeve.prior_carry_usd + self.sleeve.session_realized_usd
         total_pnl_usd = realized_pnl_usd + unrealized_pnl_usd
 
         book_key = tuple(sorted((str(p.instrument_id), round(float(p.signed_qty), 6)) for p in positions))
@@ -307,12 +324,17 @@ class PortfolioService:
         stress_grid = book_stress_grid(legs_spec, self.settings.risk_free_rate)
         worst_stress_usd = float(np.min(stress_grid))
 
-        # Approximate P-measure 1-day 99% VaR / ES from book Delta/Gamma/Vega + RV20
+        # 14-day nonlinear portfolio Monte Carlo ES99 (same horizon as ScenarioPricer)
+        book_var_99_usd, book_es_99_usd = portfolio_horizon_var_es(
+            legs_spec,
+            horizon_days=14.0,
+            r=self.settings.risk_free_rate,
+            n_scenarios=5_000,
+            seed=42,
+        )
+        # Keep 1-day linear parametric as a secondary diagnostic
         rv_20d = float(bench_rv.get("rv_20d") or bench_atm_iv)
-        book_var_99_usd, book_es_99_usd = parametric_book_var_es(beta_delta_shares, net_vega_1v, bench_spot, rv_20d)
-
-        # Sleeve equity is decoupled from IBKR NLV: allocated capital + this book's P&L
-        sleeve = self.sleeve.snapshot(realized_pnl_usd, unrealized_pnl_usd, len(positions), now_ns)
+        book_1d_linear_var_99_usd, book_1d_linear_es_99_usd = parametric_book_var_es(beta_delta_shares, net_vega_1v, bench_spot, rv_20d)
 
         payload = {
             "benchmark": bench_id,
@@ -333,6 +355,10 @@ class PortfolioService:
             "risk": {
                 "book_var_99_usd": book_var_99_usd,
                 "book_es_99_usd": book_es_99_usd,
+                "book_1d_linear_var_99_usd": book_1d_linear_var_99_usd,
+                "book_1d_linear_es_99_usd": book_1d_linear_es_99_usd,
+                "unmodeled_positions": unmodeled_positions,
+                "has_unmodeled_positions": bool(unmodeled_positions),
                 "worst_7d_stress_usd": round(worst_stress_usd, 2),
                 "spot_shocks_pct": list(SPOT_SHOCKS_PCT),
                 "vol_shocks_pts": list(VOL_SHOCKS_PTS),

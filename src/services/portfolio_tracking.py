@@ -87,28 +87,51 @@ class AttributionTracker:
 class SleeveTracker:
     """Sleeve equity (allocated capital + this book's P&L), its high-water mark and drawdown.
 
-    The in-memory cache only knows this session's realized P&L, so earlier realized P&L and the
-    high-water mark are restored from the last published snapshot.
+    ``prior_carry_usd`` holds the realized P&L from prior days only.
+    ``session_realized_usd`` is the current day's realized P&L (never folded into ``prior_carry_usd``
+    on the same NY date).  ``realized_pnl_usd = prior_carry_usd + session_realized_usd`` is thus
+    idempotent across multiple evaluations on the same day AND across same-day restarts (``restore()``).
+    The roll of ``session_realized_usd`` into ``prior_carry_usd`` happens only when the NY date changes.
     """
 
     def __init__(self, allocated_capital_usd: float) -> None:
         self.allocated_capital_usd = allocated_capital_usd
-        self.realized_carry_usd = 0.0
+        self.prior_carry_usd = 0.0
         self.high_water_mark = 0.0
+        self.session_date: str = ""
+        self.session_realized_usd: float = 0.0
 
     def restore(self, previous: Mapping[str, Any]) -> None:
-        self.realized_carry_usd = float(previous.get("realized_total_usd") or 0.0)
+        # Accept both old (realized_total_usd) and new (prior_carry_usd) persisted fields
+        raw_carry = previous.get("prior_carry_usd", previous.get("realized_total_usd"))
+        self.prior_carry_usd = float(raw_carry) if raw_carry else 0.0
         self.high_water_mark = float(previous.get("high_water_mark") or 0.0)
+        self.session_date = str(previous.get("session_date") or "")
+        self.session_realized_usd = float(previous.get("session_realized_usd") or 0.0)
 
     def snapshot(
         self,
-        realized_pnl_usd: float,
+        session_realized_usd: float,    # Current day's realized P&L (positions + closed)
         unrealized_pnl_usd: float,
         open_positions: int,
         now_ns: int,
     ) -> dict[str, Any]:
         alloc = self.allocated_capital_usd
-        equity = alloc + (realized_pnl_usd + unrealized_pnl_usd)
+        from src.common.timeutil import ny_date
+        today = ny_date(now_ns).isoformat()
+        if today != self.session_date:
+            # New day: roll yesterday's session into prior_carry
+            self.prior_carry_usd += self.session_realized_usd
+            self.session_date = today
+            self.session_realized_usd = session_realized_usd
+        else:
+            # Same day: session_realized_usd may have changed (new fills, new positions)
+            self.session_realized_usd = session_realized_usd
+
+        # realized_pnl_usd = prior_carry_usd + session_realized_usd is the canonical total
+        total_realized = self.prior_carry_usd + self.session_realized_usd
+
+        equity = alloc + (total_realized + unrealized_pnl_usd)
         if self.high_water_mark <= 0.0:
             self.high_water_mark = max(alloc, equity)
         self.high_water_mark = max(self.high_water_mark, equity)
@@ -118,8 +141,11 @@ class SleeveTracker:
             "equity": round(equity, 2),
             "high_water_mark": round(self.high_water_mark, 2),
             "drawdown_pct": round(drawdown_pct, 4),
-            "realized_total_usd": round(realized_pnl_usd, 2),
+            "prior_carry_usd": round(self.prior_carry_usd, 2),
+            "realized_total_usd": round(total_realized, 2),
             "unrealized_pnl_usd": round(unrealized_pnl_usd, 2),
             "open_positions": open_positions,
             "ts_ns": now_ns,
+            "session_date": self.session_date,
+            "session_realized_usd": round(self.session_realized_usd, 2),
         }

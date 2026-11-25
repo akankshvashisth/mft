@@ -6,6 +6,7 @@ from src.risk.scenario_pricer import (
     ScenarioPricer,
     defined_risk_margin_usd,
     friction_usd,
+    round_trip_friction_usd,
 )
 from src.scanner.combos import CandidateCombo, CandidateLeg
 
@@ -45,7 +46,70 @@ def test_friction_is_half_spread_plus_commissions():
     assert friction_usd(combo.legs, 0.5, 0.65) == pytest.approx(2 * 0.5 * 0.20 * 100.0 + 2 * 0.65)
     locked = [CandidateLeg("X", 1.0, "P", -1, 1, 2.0, 2.0, 2.0, 0.2, 0.2, 0.0, 0.0)]
     assert friction_usd(locked, 0.5, 0.0) == pytest.approx(0.5)  # Spread floored at one cent
-    assert pricer().evaluate_combo(combo).friction_cost_usd == pytest.approx(21.3)
+    assert pricer().evaluate_combo(combo).friction_cost_usd == pytest.approx(42.6)  # Round-trip: entry+exit
+
+
+# --- WP-6: ScenarioPricer hardening ----------------------------------------------------------------
+
+
+def test_bsm_carry_golden_check():
+    """BSM carry: S=100, K=100, T=0.5, r=0.05, q=0.04, sigma=0.30 matches black-scholes.py < 1e-5."""
+    from src.quant.black_scholes import bs_greeks
+
+    ref = bs_greeks(100.0, 100.0, 0.5, 0.05, 0.04, 0.30, True)
+    from src.risk.scenario_pricer import fast_vollib_price
+
+    p = fast_vollib_price(np.array([100.0]), 100.0, 0.5, 0.05, np.array([0.30]), "c", 0.04)
+    assert abs(float(p[0]) - ref["price"]) < 1e-5
+
+
+def test_round_trip_friction_deducts_more_than_entry_only():
+    """Evaluating the same spread at horizon_days=14 (< ttm_days=30) deducts strictly more friction."""
+    combo = bull_put()
+    # Entry-only friction is half-spread + commissions for 2 legs
+    entry_only = friction_usd(combo.legs, 0.5, 0.65)
+    # Round-trip is double that (entry + exit at same slippage)
+    round_trip = round_trip_friction_usd(combo.legs, 0.5, 0.65)
+    assert round_trip == pytest.approx(2 * entry_only)
+    assert round_trip > entry_only
+
+    # Actual pricer: horizon < ttm
+    p = pricer()
+    assert p.evaluate_combo(combo, horizon_days=14.0).friction_cost_usd > entry_only
+    # At horizon >= ttm, friction is entry-only
+    assert p.evaluate_combo(combo, horizon_days=30.0).friction_cost_usd == pytest.approx(entry_only, rel=0.02)
+
+
+def test_crash_tail_monotonicity():
+    """A bull put spread has es_99_usd worse (more negative = bigger loss) at higher realized vol."""
+    combo = bull_put()
+    p = pricer(n_scenarios=5_000)
+    low_vol = p.evaluate_combo(combo, realized_vol_p=0.10, horizon_days=14.0)
+    high_vol = p.evaluate_combo(combo, realized_vol_p=0.25, horizon_days=14.0)
+    # Higher RV means worse tail (more negative ES99)
+    assert low_vol.es_99_usd < 0.0  # Bull put loses in extreme down moves
+    assert high_vol.es_99_usd < low_vol.es_99_usd  # Strictly worse at higher vol
+    # |ES99| + friction <= max_width * 100
+    assert abs(high_vol.es_99_usd) <= 10.0 * 100.0 + high_vol.friction_cost_usd
+
+
+def test_crn_determinism():
+    """Evaluating candidate A then B vs B then A produces identical results."""
+    p = pricer(n_scenarios=2_000, seed=42)
+    combo_a = bull_put(short_mid=8.4, wing_mid=5.3, name="A")
+    combo_b = bull_put(short_mid=7.4, wing_mid=4.3, name="B")
+    # A then B
+    res_a_first = p.evaluate_combo(combo_a, realized_vol_p=0.20, horizon_days=14.0)
+    res_b_second = p.evaluate_combo(combo_b, realized_vol_p=0.20, horizon_days=14.0)
+    # B then A with reset pricer
+    p2 = pricer(n_scenarios=2_000, seed=42)
+    res_b_first = p2.evaluate_combo(combo_b, realized_vol_p=0.20, horizon_days=14.0)
+    res_a_second = p2.evaluate_combo(combo_a, realized_vol_p=0.20, horizon_days=14.0)
+    # A evaluated first vs second should match (same CRN)
+    assert res_a_first.net_ev_usd == pytest.approx(res_a_second.net_ev_usd, abs=0.01)
+    assert res_a_first.es_99_usd == pytest.approx(res_a_second.es_99_usd, abs=0.01)
+    assert res_b_first.net_ev_usd == pytest.approx(res_b_second.net_ev_usd, abs=0.01)
+    assert res_b_first.es_99_usd == pytest.approx(res_b_second.es_99_usd, abs=0.01)
 
 
 def test_rich_credit_is_approved_and_sized():

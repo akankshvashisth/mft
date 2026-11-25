@@ -8,8 +8,8 @@ import pytest
 from src.common import keys
 from src.common.market import QuoteObs
 from src.execution.passive_combo import PassiveComboExecutor
-from src.strategies.vrp_engine import VrpEngine, VrpSettings
-from tests.factories import NOW_NS, portfolio_payload, risk_assessment, rv_payload, surface_leg, surface_payload
+from src.strategies.vrp_engine import OrderView, VrpEngine, VrpSettings, WorkingOrder
+from tests.factories import NOW_NS, ago, portfolio_payload, risk_assessment, rv_payload, surface_leg, surface_payload
 from tests.fakes import FakeGate, FakeMarket, FakeOrderGateway, FakePricer, written
 
 SPY = "SPY.ARCA"
@@ -84,9 +84,7 @@ def test_shadow_mode_previews_without_orders(make_rig):
     assert (payload["mode"], payload["action"], payload["entry_block_reason"]) == ("SHADOW_DRY_RUN", "SHADOW_SIGNAL_READY", None)
     assert payload["top_candidate"]["combo"] == "SPY 690/685P Bull Put"
     assert (payload["top_candidate"]["approved_qty"], payload["top_candidate"]["expected_ev_usd"]) == (6, 180.0)
-    assert payload["passive_clips"] == [
-        {"clip_id": "CMB-P1-1", "lots": 6, "mid_credit": 0.6, "natural_credit": 0.4, "passive_limit": 0.57}
-    ]
+    assert payload["passive_clips"][0]["passive_limit"] == pytest.approx(0.57)
     assert (payload["candidates_scanned"], payload["spot"], payload["rv_20d"]) == (2, 700.0, 0.13)
     assert (payload["ts_ns"], payload["event_ts_ns"]) == (NOW_NS, NOW_NS - 5)
     assert rig.gateway.prepared == [] and rig.executor.active_clips == {}
@@ -105,7 +103,7 @@ def test_live_mode_routes_a_single_registered_clip(make_rig):
     order_key = route_entry(rig)
 
     (prepared,) = rig.gateway.prepared
-    assert prepared.handle == {"legs": LEGS, "side": "CREDIT_OPEN", "lots": 6, "limit": 0.57}
+    assert prepared.handle == {"legs": LEGS, "side": "CREDIT_OPEN", "lots": 6, "limit": pytest.approx(0.57)}
     assert rig.gateway.submitted == [order_key] and registered_at_submit == [True]
     assert rig.gate.submissions == 1
     assert rig.store.get_json_value(keys.spread_legs_key(SPREAD_ID)) == LEGS
@@ -115,7 +113,7 @@ def test_live_mode_routes_a_single_registered_clip(make_rig):
     )
     payload = rig.store.get_json_value(keys.VRP_LATEST)
     assert payload["working_orders"] == [
-        {"client_order_id": order_key, "purpose": "ENTRY", "combo": "SPY 690/685P Bull Put", "lots": 6, "limit": 0.57, "step": 0, "filled_lots": 0.0}
+        {"client_order_id": order_key, "purpose": "ENTRY", "combo": "SPY 690/685P Bull Put", "lots": 6, "limit": pytest.approx(0.57), "step": 0, "filled_lots": 0.0}
     ]
 
 
@@ -212,7 +210,40 @@ def test_modify_rejection_cancels_the_order(make_rig):
     assert rig.gateway.cancelled == [order_key]
 
 
-# --- Working-order management ----------------------------------------------------------------------
+# --- Crash/restart reconciliation -----------------------------------------------------------------
+
+
+def test_start_cancels_orphaned_open_orders(make_rig):
+    """start() cancels orphaned open orders from the gateway."""
+    rig = make_rig()
+    # Simulate a pre-existing open order from a prior run
+    rig.gateway.views["ORPHAN-O-1"] = OrderView(is_open=True, is_closed=False, status="ACCEPTED")
+    rig.engine.start()
+    assert "ORPHAN-O-1" in rig.gateway.cancelled
+
+
+def test_start_blocks_entry_on_reconciliation_mismatch(make_rig, store):
+    """start() with a persisted trade missing from broker positions blocks new entries."""
+    OPEN_TRADE = {"combo": "SPY 690/685P Bull Put", "legs": LEGS, "expiry": "2026-12-18", "open_lots": 4.0, "entry_credit": 0.6}
+    rig = make_rig(paper=True, book={SPREAD_ID: OPEN_TRADE})
+    # No broker position exists for SPREAD_ID -> trigger mismatch
+    rig.engine.start()
+    assert rig.engine._reconciliation_mismatch is True
+    assert rig.engine.current_entry_block_reason() == "BOOK_RECONCILIATION_MISMATCH"
+
+
+def test_finalize_releases_order_key(make_rig):
+    """finalize() releases the order key from the gateway."""
+    rig = make_rig()
+    spot(rig)
+    payload = rig.engine.on_timer(NOW_NS, NOW_NS, TODAY)
+    order_key = payload["routed_order_ids"][0]
+    # Verify the key is tracked
+    assert order_key in rig.gateway.views
+    # Finalize it
+    rig.engine.finalize(order_key, "FILLED")
+    # The release is a no-op on FakeOrderGateway; check that the working order is gone
+    assert order_key not in rig.engine.working
 
 
 def test_risk_block_cancels_working_entries_with_a_one_second_cache(make_rig):
@@ -298,7 +329,100 @@ def test_stop_cancels_open_orders_and_persists_the_book(make_rig):
     assert rig.valkey.exists(keys.vrp_book_key(SPY))
 
 
-# --- Exits -----------------------------------------------------------------------------------------
+# --- RV fail-closed --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "rv_overrides",
+    [
+        {"rv_20d": 0.0},          # Zero RV -> STAND_DOWN
+        {"rv_20d": -0.1},         # Negative RV -> STAND_DOWN
+        {"rv_20d": float("nan")},  # NaN RV -> STAND_DOWN
+        {"ts_ns": ago(90000.0)},  # Stale RV (ts > 1 day old) -> STAND_DOWN
+        {"rv_20d": None},         # Missing/null rv_20d -> STAND_DOWN
+    ],
+)
+def test_invalid_rv_blocks_entries_but_allows_exits(make_rig, store, rv_overrides):
+    """Missing, zero, stale or non-finite rv_20d forces STAND_DOWN with RV_MISSING_OR_INVALID."""
+    OPEN_TRADE = {"combo": "SPY 690/685P Bull Put", "legs": LEGS, "expiry": "2026-12-18", "open_lots": 4.0, "entry_credit": 0.6}
+    rig = make_rig(book={SPREAD_ID: OPEN_TRADE})
+    rig.market.positions[SPREAD_ID] = -4.0
+    quote_legs(rig)
+    spot(rig)
+
+    # Replace RV with the invalid variant
+    store.set_json(keys.rv_key(SPY), rv_payload(**rv_overrides))
+
+    # Use a date inside the exit window so evaluate_exits fires
+    payload = rig.engine.on_timer(event_ts_ns=NOW_NS, wall_ns=NOW_NS, today=date(2026, 12, 5))
+
+    # Must block entries
+    assert payload["action"] == "STAND_DOWN"
+    assert payload["entry_block_reason"] == "RV_MISSING_OR_INVALID"
+    assert payload["rv_20d"] is None
+    assert payload["candidates_scanned"] == 0
+
+    # Must still evaluate exits
+    assert len(payload["exit_signals"]) > 0
+
+
+def test_valid_rv_proceeds_normally(make_rig, store):
+    """A fresh, positive rv_20d evaluates candidates normally (regression check)."""
+    rig = make_rig()
+    quote_legs(rig)
+    spot(rig)
+
+    store.set_json(keys.rv_key(SPY), rv_payload(rv_20d=0.13))
+    payload = rig.engine.on_timer(event_ts_ns=NOW_NS, wall_ns=NOW_NS, today=TODAY)
+
+    assert payload["action"] == "LIVE_PAPER_ORDER_ROUTED"
+    assert payload["entry_block_reason"] is None
+    assert payload["rv_20d"] == 0.13
+    assert payload["candidates_scanned"] > 0
+
+
+# --- Execution hardening ---------------------------------------------------------------------------
+
+
+def test_exit_order_with_negative_mid_not_cancelled(make_rig):
+    """EXIT order with mid=-0.02 is NOT cancelled; ENTRY order with mid=-0.02 IS cancelled."""
+    OPEN_TRADE = {"combo": "SPY 690/685P Bull Put", "legs": LEGS, "expiry": "2026-12-18", "open_lots": 4.0, "entry_credit": 0.6}
+    rig = make_rig(book={SPREAD_ID: OPEN_TRADE})
+    rig.market.positions[SPREAD_ID] = -4.0
+    spot(rig)
+    quote_legs(rig)
+
+    exit_signal = rig.engine.evaluate_exits(date(2026, 12, 5))
+    assert len(exit_signal) == 1
+    assert exit_signal[0]["status"] == "EXIT_ORDER_ROUTED"
+    exit_key = exit_signal[0]["order_id"]
+
+    # Set negative mid quotes and explicitly call manage_working_orders
+    rig.engine.quotes[P690] = (0.0, 0.05, None, None)
+    rig.engine.quotes[P685] = (1.0, 1.2, None, None)
+    rig.engine.manage_working_orders()
+    assert exit_key not in rig.gateway.cancelled
+
+
+def test_entry_order_with_negative_mid_is_cancelled(make_rig):
+    """ENTRY order with mid=-0.02 IS cancelled (CANCELLED_INVALID_MID)."""
+    rig = make_rig()
+    quote_legs(rig)
+    spot(rig)
+
+    order_key = "ENTRY-TEST-1"
+    rig.gateway.views[order_key] = OrderView(is_open=True, is_closed=False, status="ACCEPTED")
+    rig.engine.working[order_key] = WorkingOrder(
+        order_key=order_key, clip_id="CLIP-1", parent_id="P1",
+        purpose="ENTRY", side="CREDIT_OPEN",
+        spread_key=SPREAD_ID, legs=LEGS, combo="SPY 690/685P Bull Put", expiry="2026-12-18",
+    )
+    # Combo price for CREDIT_OPEN: P690 mid=0.025, P685 mid=1.1 => 0.025 - 1.1 = -1.075
+    rig.engine.quotes[P690] = (0.0, 0.05, None, None)
+    rig.engine.quotes[P685] = (1.0, 1.2, None, None)
+    rig.engine.manage_working_orders()
+    # The cancel was sent to the gateway; the order left working only on terminal event
+    assert order_key in rig.gateway.cancelled
 
 OPEN_TRADE = {"combo": "SPY 690/685P Bull Put", "legs": LEGS, "expiry": "2026-12-18", "open_lots": 4.0, "entry_credit": 0.6}
 

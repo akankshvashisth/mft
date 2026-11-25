@@ -62,7 +62,20 @@ def instrument_info(instrument: Any, kind: str) -> InstrumentInfo:
         spec = option_spec_from_instrument(instrument)
         return InstrumentInfo(OPTION, spec.multiplier, spec)
     default = 100.0 if kind == OPTION_SPREAD else 1.0
-    return InstrumentInfo(kind, float(getattr(instrument, "multiplier", default) or default))
+    mult = float(getattr(instrument, "multiplier", default) or default)
+    # Populate spread_legs from OptionSpread.info["legs"] if available
+    info = getattr(instrument, "info", None) or {}
+    raw_legs = info.get("legs") if isinstance(info, dict) else None
+    spread_legs: tuple[tuple[str, int], ...] | None = None
+    if isinstance(raw_legs, (list, tuple)):
+        try:
+            spread_legs = tuple(
+                (str(leg.get("instrument_id", "")), int(leg.get("ratio", 1)))
+                for leg in raw_legs if isinstance(leg, dict)
+            ) or None
+        except (TypeError, ValueError):
+            pass
+    return InstrumentInfo(kind, mult, spread_legs=spread_legs)
 
 
 def position_view(position: Any) -> PositionView:
