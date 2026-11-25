@@ -298,3 +298,143 @@ def test_gate_parity_checks():
     short2["ask"] = 2.5  # Very wide spread
     reasons = _gate_parity_checks(day_df, short2, wing, mid_credit, nat_credit, max_leg_spread_pct=0.25)
     assert any("WIDE_LEG_SPREAD" in r for r in reasons)
+
+
+# ── New WP-10 multi-expiry / delta-targeted / TOB parity tests ──────────────────────
+
+
+def test_multi_expiry_exit_matches_exact_expiry():
+    """Chain with 7-DTE and 30-DTE expiries at the same strikes.
+
+    The 7-DTE quotes are cheap -> would trigger PROFIT_TARGET.  Entry must pick
+    30-DTE and exits must mark against 30-DTE quotes, never the 7-DTE.
+    """
+    spot = 100.0
+    expiry_7 = (START + timedelta(days=7)).isoformat()
+    expiry_30 = (START + timedelta(days=30)).isoformat()
+
+    rows = []
+    for d in range(25):
+        dt = (START + timedelta(days=d)).isoformat()
+        # 7-DTE: very tight (cheap)
+        for strike, (bid, ask) in {80.0: (0.05, 0.07), 85.0: (0.10, 0.12), 90.0: (0.15, 0.17)}.items():
+            rows.append({
+                "date": dt, "expiry": expiry_7, "dte": max(0, 7 - d),
+                "spot": spot, "rv_20d": 0.15, "atm_iv": 0.20,
+                "right": "P", "strike": strike, "bid": bid, "ask": ask,
+                "mid": round(0.5 * (bid + ask), 4), "iv": 0.20,
+            })
+        # 30-DTE: wider spreads so gate passes (spread <= 18%)
+        for strike, (bid, ask) in {80.0: (0.48, 0.52), 85.0: (0.95, 1.05), 90.0: (1.90, 2.10)}.items():
+            rows.append({
+                "date": dt, "expiry": expiry_30, "dte": 30 - d,
+                "spot": spot, "rv_20d": 0.15, "atm_iv": 0.20,
+                "right": "P", "strike": strike, "bid": bid, "ask": ask,
+                "mid": round(0.5 * (bid + ask), 4), "iv": 0.20,
+            })
+    df = pd.DataFrame(rows)
+
+    pricer = FakePricer(lambda combo: risk_assessment(recommended_contracts=1, approved=True))
+    summary = run(df, pricer=pricer, max_concurrent_trades=1)
+
+    assert summary["completed_trades"] == 1, f"Expected 1 trade, got {summary}"
+    assert summary["avg_holding_calendar_days"] >= 14, (
+        f"Expected longer hold for 30-DTE, got {summary['avg_holding_calendar_days']}"
+    )
+
+
+def test_delta_targeted_verticals_mode_in_backtest():
+    """$3-spaced $40 mid-cap chain with use_delta_targeted=True finds a trade.
+
+    Strikes 35, 38, 41 so (38,35) = $3 wide >= $2.50 and short strike 38 has
+    delta ~0.21 in [0.15, 0.30], width_pct = 3/40 = 7.5% in [4%, 12%].
+    """
+    spot = 40.0
+    expiry = (START + timedelta(days=30)).isoformat()
+    rows = []
+    for d in range(25):
+        dt = (START + timedelta(days=d)).isoformat()
+        for strike, (bid, ask) in [
+            (41.0, (1.50, 1.60)),  # ITM put
+            (38.0, (0.80, 0.85)),  # OTM, delta ~0.21
+            (35.0, (0.25, 0.29)),  # OTM, spread=15.4% < 18%
+        ]:
+            rows.append({
+                "date": dt, "expiry": expiry, "dte": 30 - d,
+                "spot": spot, "rv_20d": 0.15, "atm_iv": 0.25,
+                "right": "P", "strike": strike, "bid": bid, "ask": ask,
+                "mid": round(0.5 * (bid + ask), 4), "iv": 0.25,
+            })
+    df = pd.DataFrame(rows)
+
+    pricer = FakePricer(lambda combo: risk_assessment(recommended_contracts=1, approved=True))
+    summary = run(df, pricer=pricer, use_delta_targeted=True, max_concurrent_trades=1)
+
+    assert summary["completed_trades"] >= 1, (
+        f"Delta-targeted should find a trade, got {summary}"
+    )
+
+
+def test_tob_size_parity_caps_and_blocks():
+    """Chain with bid_size=2 blocks entry; chain with bid_size=8 allows entry."""
+    expiry = (START + timedelta(days=30)).isoformat()
+    spot = 100.0
+
+    def make_chain(bid_sz, ask_sz):
+        rows = []
+        for d in range(25):
+            dt = (START + timedelta(days=d)).isoformat()
+            for strike, (bid, ask) in {80.0: (0.48, 0.52), 85.0: (0.95, 1.05), 90.0: (1.90, 2.10)}.items():
+                rows.append({
+                    "date": dt, "expiry": expiry, "dte": 30 - d,
+                    "spot": spot, "rv_20d": 0.15, "atm_iv": 0.20,
+                    "right": "P", "strike": strike, "bid": bid, "ask": ask,
+                    "mid": round(0.5 * (bid + ask), 4), "iv": 0.20,
+                    "bid_size": bid_sz, "ask_size": ask_sz,
+                })
+        return pd.DataFrame(rows)
+
+    # bid_size=2 < min_tob_size=4 -> blocks entry
+    pricer = FakePricer(lambda combo: risk_assessment(recommended_contracts=1, approved=True))
+    s = run(make_chain(2, 2), pricer=pricer, max_concurrent_trades=1)
+    assert s["completed_trades"] == 0, f"Expected 0 trades with bid_size=2, got {s['completed_trades']}"
+
+    # bid_size=8 allows entry (capped via participation)
+    pricer2 = FakePricer(lambda combo: risk_assessment(recommended_contracts=3, approved=True))
+    s2 = run(make_chain(8, 8), pricer=pricer2, max_concurrent_trades=1)
+    assert s2["completed_trades"] >= 1, f"Expected trade with bid_size=8, got {s2}"
+
+
+def test_bsm_fallback_preserves_exit_mid_in_friction():
+    """Missing exit quotes trigger BSM fallback; total_friction_usd > 0."""
+    spot = 100.0
+    expiry = (START + timedelta(days=30)).isoformat()
+
+    rows = []
+    wide = {80.0: (0.48, 0.52), 85.0: (0.95, 1.05), 90.0: (1.90, 2.10)}
+    for d in range(5):
+        dt = (START + timedelta(days=d)).isoformat()
+        for strike, (bid, ask) in wide.items():
+            rows.append({
+                "date": dt, "expiry": expiry, "dte": 30 - d,
+                "spot": spot, "rv_20d": 0.15, "atm_iv": 0.25,
+                "right": "P", "strike": strike, "bid": bid, "ask": ask,
+                "mid": round(0.5 * (bid + ask), 4), "iv": 0.25,
+            })
+    # Day 5: only short strike (90) present - triggers BSM fallback
+    day5 = (START + timedelta(days=5)).isoformat()
+    for strike, (bid, ask) in {90.0: (0.55, 0.59)}.items():
+        rows.append({
+            "date": day5, "expiry": expiry, "dte": 25,
+            "spot": spot, "rv_20d": 0.15, "atm_iv": 0.25,
+            "right": "P", "strike": strike, "bid": bid, "ask": ask,
+            "mid": round(0.5 * (bid + ask), 4), "iv": 0.25,
+        })
+    df = pd.DataFrame(rows)
+
+    pricer = FakePricer(lambda combo: risk_assessment(recommended_contracts=1, approved=True))
+    s = run(df, pricer=pricer, max_concurrent_trades=1)
+
+    assert s["completed_trades"] == 1, f"Expected 1 trade, got {s}"
+    assert s["fallback_exit_marks"] == 1, "Expected BSM fallback"
+    assert s["total_friction_usd"] > 0.0, f"Expected positive friction, got {s['total_friction_usd']}"
