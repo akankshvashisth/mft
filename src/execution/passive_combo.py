@@ -39,10 +39,10 @@ def round_to_tick(price: float, tick_size: float, side: str) -> float:
     eps = 1e-9
     units = price / tick_size
     if side == CREDIT_OPEN:
-        return math.ceil(units - eps) * tick_size
+        return round(math.ceil(units - eps) * tick_size, 6)
     if side == DEBIT_CLOSE:
-        return math.floor(units + eps) * tick_size
-    return round(units) * tick_size
+        return round(math.floor(units + eps) * tick_size, 6)
+    return round(round(units) * tick_size, 6)
 
 
 @dataclass

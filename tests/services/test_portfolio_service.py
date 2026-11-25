@@ -224,25 +224,27 @@ def test_surfaces_are_keyed_by_symbol(make_service, store):
 
 
 def test_realized_pnl_idempotent_after_restore(make_service, store):
-    """Calling evaluate() -> restore() -> evaluate() on the same day reports the same realized P&L."""
-    store.set_json(keys.POSITIONS_LATEST, positions_payload(prior_carry_usd=500.0, high_water_mark=101_000.0))
+    """Start with prior_carry_usd=0.0, pass non-zero closed_realized_usd=500.0 on Day 1.
+
+    Verify evaluate() -> evaluate() -> restore() -> evaluate() all report 500.0,
+    and Day 2 with closed_realized_usd=100.0 reports 600.0 on the first tick.
+    """
     service = make_service()
-    service.restore()
 
-    # First evaluate: 500 carry + 0 session = 500
-    p1 = service.evaluate([PositionView(SPY, 0.0, 700.0, realized_pnl=0.0)], 0.0, NOW_NS)
-    assert p1["realized_pnl_usd"] == 500.0
+    # Day 1: first evaluate with 500 closed realized
+    p1 = service.evaluate([PositionView(SPY, 0.0, 700.0, realized_pnl=0.0)], 500.0, NOW_NS)
+    assert p1["realized_pnl_usd"] == 500.0, f"Expected 500.0, got {p1['realized_pnl_usd']}"
 
-    # Second evaluate on same day: should still be 500 (session_realized_usd stays 0)
-    p2 = service.evaluate([PositionView(SPY, 0.0, 700.0, realized_pnl=0.0)], 0.0, NOW_NS + 60_000_000_000)
+    # Second evaluate on same day: still 500 (session_realized_usd unchanged)
+    p2 = service.evaluate([PositionView(SPY, 0.0, 700.0, realized_pnl=0.0)], 500.0, NOW_NS + 60_000_000_000)
     assert p2["realized_pnl_usd"] == 500.0, f"Expected 500.0, got {p2['realized_pnl_usd']}"
 
     # Simulate restart: restore() from the persisted sleeve
     service.restore()
-    p3 = service.evaluate([PositionView(SPY, 0.0, 700.0, realized_pnl=0.0)], 0.0, NOW_NS + 120_000_000_000)
+    p3 = service.evaluate([PositionView(SPY, 0.0, 700.0, realized_pnl=0.0)], 500.0, NOW_NS + 120_000_000_000)
     assert p3["realized_pnl_usd"] == 500.0, f"Expected 500.0, got {p3['realized_pnl_usd']}"
 
-    # Next NY date: test that prior_carry rolls
+    # Next NY date: Day 2 with closed_realized_usd=100.0 reports 600.0 on first tick
     from tests.factories import utc_ns
     next_day = utc_ns(2026, 11, 25, 15)
     p4 = service.evaluate([PositionView(SPY, 0.0, 700.0, realized_pnl=0.0)], 100.0, next_day)

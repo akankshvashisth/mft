@@ -299,7 +299,10 @@ class PortfolioService:
         net_gamma_1pct = totals["gamma_1pct"]
         net_vega_1v = totals["vega_1v"]
         net_theta_day = totals["theta_day"]
-        realized_pnl_usd = self.sleeve.prior_carry_usd + session_realized_usd
+
+        # Snapshot FIRST — Day 1 → Day 2 rollover happens inside, making prior_carry consistent
+        sleeve = self.sleeve.snapshot(session_realized_usd, unrealized_pnl_usd, len(positions), now_ns)
+        realized_pnl_usd = self.sleeve.prior_carry_usd + self.sleeve.session_realized_usd
         total_pnl_usd = realized_pnl_usd + unrealized_pnl_usd
 
         book_key = tuple(sorted((str(p.instrument_id), round(float(p.signed_qty), 6)) for p in positions))
@@ -332,9 +335,6 @@ class PortfolioService:
         # Keep 1-day linear parametric as a secondary diagnostic
         rv_20d = float(bench_rv.get("rv_20d") or bench_atm_iv)
         book_1d_linear_var_99_usd, book_1d_linear_es_99_usd = parametric_book_var_es(beta_delta_shares, net_vega_1v, bench_spot, rv_20d)
-
-        # Sleeve equity is decoupled from IBKR NLV: allocated capital + this book's P&L
-        sleeve = self.sleeve.snapshot(session_realized_usd, unrealized_pnl_usd, len(positions), now_ns)
 
         payload = {
             "benchmark": bench_id,
