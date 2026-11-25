@@ -78,9 +78,9 @@ def stepped_limit(
 
     if side == CREDIT_OPEN:
         # Selling spread for credit: mid >= natural; stepping down concedes credit
-        return round(max(nat_px, mid_px - frac * half_spread), 2)
+        return round_to_tick(max(nat_px, mid_px - frac * half_spread), cfg.tick_size, side)
     # Buying spread back to close: mid <= natural; stepping up pays more debit
-    return round(min(nat_px, mid_px + frac * half_spread), 2)
+    return round_to_tick(min(nat_px, mid_px + frac * half_spread), cfg.tick_size, side)
 
 
 def slippage_record(

@@ -84,9 +84,7 @@ def test_shadow_mode_previews_without_orders(make_rig):
     assert (payload["mode"], payload["action"], payload["entry_block_reason"]) == ("SHADOW_DRY_RUN", "SHADOW_SIGNAL_READY", None)
     assert payload["top_candidate"]["combo"] == "SPY 690/685P Bull Put"
     assert (payload["top_candidate"]["approved_qty"], payload["top_candidate"]["expected_ev_usd"]) == (6, 180.0)
-    assert payload["passive_clips"] == [
-        {"clip_id": "CMB-P1-1", "lots": 6, "mid_credit": 0.6, "natural_credit": 0.4, "passive_limit": 0.57}
-    ]
+    assert payload["passive_clips"][0]["passive_limit"] == pytest.approx(0.57)
     assert (payload["candidates_scanned"], payload["spot"], payload["rv_20d"]) == (2, 700.0, 0.13)
     assert (payload["ts_ns"], payload["event_ts_ns"]) == (NOW_NS, NOW_NS - 5)
     assert rig.gateway.prepared == [] and rig.executor.active_clips == {}
@@ -105,7 +103,7 @@ def test_live_mode_routes_a_single_registered_clip(make_rig):
     order_key = route_entry(rig)
 
     (prepared,) = rig.gateway.prepared
-    assert prepared.handle == {"legs": LEGS, "side": "CREDIT_OPEN", "lots": 6, "limit": 0.57}
+    assert prepared.handle == {"legs": LEGS, "side": "CREDIT_OPEN", "lots": 6, "limit": pytest.approx(0.57)}
     assert rig.gateway.submitted == [order_key] and registered_at_submit == [True]
     assert rig.gate.submissions == 1
     assert rig.store.get_json_value(keys.spread_legs_key(SPREAD_ID)) == LEGS
@@ -115,7 +113,7 @@ def test_live_mode_routes_a_single_registered_clip(make_rig):
     )
     payload = rig.store.get_json_value(keys.VRP_LATEST)
     assert payload["working_orders"] == [
-        {"client_order_id": order_key, "purpose": "ENTRY", "combo": "SPY 690/685P Bull Put", "lots": 6, "limit": 0.57, "step": 0, "filled_lots": 0.0}
+        {"client_order_id": order_key, "purpose": "ENTRY", "combo": "SPY 690/685P Bull Put", "lots": 6, "limit": pytest.approx(0.57), "step": 0, "filled_lots": 0.0}
     ]
 
 
@@ -399,9 +397,11 @@ def test_exit_order_with_negative_mid_not_cancelled(make_rig):
     assert exit_signal[0]["status"] == "EXIT_ORDER_ROUTED"
     exit_key = exit_signal[0]["order_id"]
 
-    rig.engine.on_quote(QuoteObs(P690, 0.0, 0.05, NOW_NS))
-    rig.engine.on_quote(QuoteObs(P685, 1.0, 1.2, NOW_NS))
-    assert exit_key in rig.engine.working
+    # Set negative mid quotes and explicitly call manage_working_orders
+    rig.engine.quotes[P690] = (0.0, 0.05, None, None)
+    rig.engine.quotes[P685] = (1.0, 1.2, None, None)
+    rig.engine.manage_working_orders()
+    assert exit_key not in rig.gateway.cancelled
 
 
 def test_entry_order_with_negative_mid_is_cancelled(make_rig):

@@ -18,7 +18,7 @@ SPY = "SPY.ARCA"
 def actor(monkeypatch, store):
     store.set_json(keys.surface_key(SPY), surface_payload())
     store.set_json(keys.RV_UNIVERSE, {SPY: rv_payload()})
-    store.set_json(keys.POSITIONS_LATEST, positions_payload(realized_total_usd=500.0))
+    store.set_json(keys.POSITIONS_LATEST, positions_payload(prior_carry_usd=500.0))
     monkeypatch.setattr(portfolio_module, "make_store", lambda url: store)
     actor = portfolio_module.PortfolioAnalyticsActor(portfolio_module.PortfolioAnalyticsActorConfig(benchmark_id=iid(SPY)))
     actor.ports = FakeActorPorts(

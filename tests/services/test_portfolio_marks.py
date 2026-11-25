@@ -149,7 +149,7 @@ def test_attribution_waits_for_a_benchmark_price():
 
 def test_sleeve_tracks_high_water_mark_and_drawdown():
     sleeve = SleeveTracker(100_000.0)
-    up = sleeve.snapshot(realized_pnl_usd=0.0, unrealized_pnl_usd=2_000.0, open_positions=1, now_ns=NOW_NS)
+    up = sleeve.snapshot(session_realized_usd=0.0, unrealized_pnl_usd=2_000.0, open_positions=1, now_ns=NOW_NS)
     assert (up["equity"], up["high_water_mark"], up["drawdown_pct"]) == (102_000.0, 102_000.0, 0.0)
 
     down = sleeve.snapshot(500.0, -3_500.0, 1, NOW_NS + 1)
@@ -160,7 +160,7 @@ def test_sleeve_tracks_high_water_mark_and_drawdown():
 
 def test_sleeve_restores_carry_and_high_water_mark():
     sleeve = SleeveTracker(100_000.0)
-    sleeve.restore({"realized_total_usd": 750.0, "high_water_mark": 101_000.0})
-    assert (sleeve.realized_carry_usd, sleeve.high_water_mark) == (750.0, 101_000.0)
+    sleeve.restore({"prior_carry_usd": 750.0, "high_water_mark": 101_000.0})
+    assert (sleeve.prior_carry_usd, sleeve.high_water_mark) == (750.0, 101_000.0)
     sleeve.restore({})
-    assert (sleeve.realized_carry_usd, sleeve.high_water_mark) == (0.0, 0.0)
+    assert (sleeve.prior_carry_usd, sleeve.high_water_mark) == (0.0, 0.0)

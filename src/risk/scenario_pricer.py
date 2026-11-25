@@ -183,29 +183,19 @@ class ScenarioPricer:
         rng = np.random.default_rng(self.seed)
         scale_t = np.sqrt((STUDENT_T_DOF - 2.0) / STUDENT_T_DOF)  # unit-variance scaling
 
-        # Student-t 5 spot draws
-        z_spot_raw = rng.standard_t(df=STUDENT_T_DOF, size=self.n_scenarios) / scale_t
+        # Student-t 5 spot draws (scaled to unit variance by multiplying by scale_t)
+        z_spot_raw = rng.standard_t(df=STUDENT_T_DOF, size=self.n_scenarios) * scale_t
 
         # Tail correlation: mix market and idiosyncratic components
         z_market = z_spot_raw.copy()
-        z_idio = rng.standard_t(df=STUDENT_T_DOF, size=self.n_scenarios) / scale_t
+        z_idio = rng.standard_t(df=STUDENT_T_DOF, size=self.n_scenarios) * scale_t
         rho = np.where(z_market < 0.0, TAIL_CORR_DOWN, TAIL_CORR_UP)
         z_spot = rho * z_market + np.sqrt(1.0 - rho ** 2) * z_idio
 
-        # Leverage-correlated vol shock: -β * r_S + η * sqrt(dt) * Z_vol + skew_adjustment
+        # Leverage-correlated vol shock (matching WP-3's portfolio_horizon_var_es)
         z_vol_raw = rng.standard_normal(size=self.n_scenarios)
         r_S = realized_vol_p * np.sqrt(dt_years) * z_spot  # log-return
-        vol_lev = -BETA_LEV * r_S / max(dt_years, 1e-6)  # vol pts / year
-        vol_of_vol = VOL_OF_VOL_FRAC * realized_vol_p * np.sqrt(dt_years) * z_vol_raw
-
-        # Sticky-delta skew slide: approximate ∆ln(K/F) per leg
-        skew_shift = 0.0
-        for leg in combo.legs:
-            k = np.log(leg.strike / combo.spot)
-            skew_shift += abs(leg.side) * SKEW_SLOPE * k * z_spot
-        skew_adjust = skew_shift / max(len(combo.legs), 1)
-
-        vol_shift_sim = vol_lev * dt_years + vol_of_vol + skew_adjust * realized_vol_p * np.sqrt(dt_years)
+        vol_shift_sim = -BETA_LEV * r_S + VOL_OF_VOL_FRAC * realized_vol_p * np.sqrt(dt_years) * z_vol_raw
 
         # Exact BSM carry: drift uses risk-free rate - dividend yield
         drift = (combo.risk_free_rate - combo.dividend_yield - 0.5 * realized_vol_p ** 2) * dt_years

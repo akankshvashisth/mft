@@ -81,21 +81,16 @@ def test_round_trip_friction_deducts_more_than_entry_only():
 
 
 def test_crash_tail_monotonicity():
-    """A bear put spread (short P690, long P685) es_99_usd is bounded by max_width * 100."""
-    # Bear put spread: buy P690, sell P685 (betting on a decline)
-    buy_put = CandidateLeg("SPY P690", 690.0, "P", +1, 1, 2.0, 2.2, 2.1, 0.17, 0.17, 0.0, 0.0)
-    sell_put = CandidateLeg("SPY P685", 685.0, "P", -1, 1, 1.4, 1.6, 1.5, 0.18, 0.18, 0.0, 0.0)
-    combo = CandidateCombo(
-        name="SPY 690/685P Bear Put", strategy_type="BULL_PUT_SPREAD", underlying="SPY.ARCA",
-        spot=700.0, forward=701.0, ttm_days=30.0, risk_free_rate=0.0425, dividend_yield=0.0125,
-        legs=[buy_put, sell_put], net_credit=0.6, max_width=5.0,
-    )
-    p = pricer(n_scenarios=2_000)
-    result = p.evaluate_combo(combo, realized_vol_p=0.25, horizon_days=14.0)
-    # For a bearish spread, the 99th percentile tail risk (loss |loss|) should be positive
-    loss = -result.es_99_usd if result.es_99_usd < 0 else result.es_99_usd
-    # 5-wide spread max loss = $500; ES99 should be less than full loss
-    assert 0.0 <= loss <= 600.0, f"ES99 ${result.es_99_usd:.2f} outside bounds"
+    """A bull put spread has es_99_usd worse (more negative = bigger loss) at higher realized vol."""
+    combo = bull_put()
+    p = pricer(n_scenarios=5_000)
+    low_vol = p.evaluate_combo(combo, realized_vol_p=0.10, horizon_days=14.0)
+    high_vol = p.evaluate_combo(combo, realized_vol_p=0.25, horizon_days=14.0)
+    # Higher RV means worse tail (more negative ES99)
+    assert low_vol.es_99_usd < 0.0  # Bull put loses in extreme down moves
+    assert high_vol.es_99_usd < low_vol.es_99_usd  # Strictly worse at higher vol
+    # |ES99| + friction <= max_width * 100
+    assert abs(high_vol.es_99_usd) <= 10.0 * 100.0 + high_vol.friction_cost_usd
 
 
 def test_crn_determinism():

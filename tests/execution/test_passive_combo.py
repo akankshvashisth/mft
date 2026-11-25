@@ -27,7 +27,12 @@ CFG = PassiveExecutionConfig()
     ],
 )
 def test_limits_step_toward_natural_until_the_cap(side, mid, natural, limits):
-    assert [stepped_limit(side, mid, natural, step, CFG) for step in range(4)] == limits
+    got = [stepped_limit(side, mid, natural, step, CFG) for step in range(4)]
+    for g, l in zip(got, limits):
+        if l is None:
+            assert g is None
+        else:
+            assert g == pytest.approx(l)
 
 
 def test_limit_never_crosses_natural():
@@ -211,3 +216,20 @@ def test_round_to_tick():
     assert round_to_tick(1.20, 0.05, DEBIT_CLOSE) == pytest.approx(1.20)
     assert round_to_tick(1.249, 0.05, CREDIT_OPEN) == 1.25
     assert round_to_tick(1.249, 0.05, DEBIT_CLOSE) == pytest.approx(1.20)
+
+
+def test_tick_size_produces_aligned_limits():
+    """PassiveExecutionConfig(tick_size=0.05) produces $0.05-aligned limits on create_parent_plan."""
+    cfg = PassiveExecutionConfig(tick_size=0.05, initial_mid_offset_frac=0.20, max_child_clip_lots=8)
+    clock = mock.Mock(return_value=1_000.0)
+    executor = PassiveComboExecutor(cfg, clock=clock, fill_sink=recording_sink())
+    clips = executor.create_parent_plan("SPY.ARCA", "x", "CREDIT_OPEN", 5, 700.0, 1.03, 0.80)
+    # mid=1.03, natural=0.80, half_spread=0.23, offset=0.20*0.23=0.046
+    # stepped: max(0.80, 1.03 - 0.046) = 0.984 -> round_to_tick(0.984, 0.05, CREDIT_OPEN) = ceil(0.984/0.05)*0.05 = 1.00
+    assert clips[0].current_limit_price == pytest.approx(1.00)
+    # Advance clock to trigger dwell step
+    clock.return_value += 21.0
+    executor.on_market_tick("SPY.ARCA", 700.0, 1.03, 0.80, now_mono=clock())
+    # After step 1: frac = 0.20 + 0.25 = 0.45, half_spread = 0.23
+    # stepped: max(0.80, 1.03 - 0.45*0.23) = max(0.80, 0.927) = 0.927 -> round_to_tick = ceil(0.927/0.05)*0.05 = 0.95
+    assert clips[0].current_limit_price == pytest.approx(0.95)

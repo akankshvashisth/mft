@@ -163,7 +163,7 @@ def test_underlying_spot_falls_back_to_a_live_quote(make_service, store, market)
 
 
 def test_realized_pnl_and_restored_sleeve_state(make_service, store):
-    store.set_json(keys.POSITIONS_LATEST, positions_payload(realized_total_usd=500.0, high_water_mark=101_000.0))
+    store.set_json(keys.POSITIONS_LATEST, positions_payload(prior_carry_usd=500.0, high_water_mark=101_000.0))
     service = make_service()
     service.restore()
 
@@ -225,7 +225,7 @@ def test_surfaces_are_keyed_by_symbol(make_service, store):
 
 def test_realized_pnl_idempotent_after_restore(make_service, store):
     """Calling evaluate() -> restore() -> evaluate() on the same day reports the same realized P&L."""
-    store.set_json(keys.POSITIONS_LATEST, positions_payload(realized_total_usd=500.0, high_water_mark=101_000.0))
+    store.set_json(keys.POSITIONS_LATEST, positions_payload(prior_carry_usd=500.0, high_water_mark=101_000.0))
     service = make_service()
     service.restore()
 
@@ -233,13 +233,20 @@ def test_realized_pnl_idempotent_after_restore(make_service, store):
     p1 = service.evaluate([PositionView(SPY, 0.0, 700.0, realized_pnl=0.0)], 0.0, NOW_NS)
     assert p1["realized_pnl_usd"] == 500.0
 
-    # Simulate restart: restore the snapshot from the first evaluation
-    sleeve = store.get_json(keys.POSITIONS_LATEST)
-    service.restore()
-
-    # Second evaluate on same day: should still be 500, not 1000
+    # Second evaluate on same day: should still be 500 (session_realized_usd stays 0)
     p2 = service.evaluate([PositionView(SPY, 0.0, 700.0, realized_pnl=0.0)], 0.0, NOW_NS + 60_000_000_000)
     assert p2["realized_pnl_usd"] == 500.0, f"Expected 500.0, got {p2['realized_pnl_usd']}"
+
+    # Simulate restart: restore() from the persisted sleeve
+    service.restore()
+    p3 = service.evaluate([PositionView(SPY, 0.0, 700.0, realized_pnl=0.0)], 0.0, NOW_NS + 120_000_000_000)
+    assert p3["realized_pnl_usd"] == 500.0, f"Expected 500.0, got {p3['realized_pnl_usd']}"
+
+    # Next NY date: test that prior_carry rolls
+    from tests.factories import utc_ns
+    next_day = utc_ns(2026, 11, 25, 15)
+    p4 = service.evaluate([PositionView(SPY, 0.0, 700.0, realized_pnl=0.0)], 100.0, next_day)
+    assert p4["realized_pnl_usd"] == 600.0, f"Expected 600.0, got {p4['realized_pnl_usd']}"
 
 
 def test_defined_risk_credit_spread_es99_is_bounded(make_service, store, market):

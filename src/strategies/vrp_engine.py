@@ -181,6 +181,7 @@ class VrpEngine:
         self._rv_block_reason: str | None = None
         self._reconciliation_mismatch: bool = False
         self._not_confirmed_count: dict[str, int] = {}
+        self._last_rv_20d: float | None = None
 
     # --- Lifecycle -------------------------------------------------------------------------------
 
@@ -204,24 +205,15 @@ class VrpEngine:
         self._reconciliation_mismatch = False
         if self.settings.paper_routing_enabled:
             net_qty = self.market.net_position_qty
+            mismatches = leg_mismatches(self.book, net_qty)
             for key, trade in list(self.book.trades.items()):
-                # Check spread-level match
-                if abs(net_qty(key) + float(trade.get("open_lots", 0.0))) < 1e-6:
+                if exit_confirmed(key, trade, mismatches, net_qty):
                     continue
-                # Check leg-level match
-                leg_match = True
-                for leg in trade["legs"]:
-                    leg_id = str(leg["instrument_id"])
-                    expected_leg = -float(trade["open_lots"]) * int(leg["ratio"])
-                    if abs(net_qty(leg_id) - expected_leg) > 1e-6:
-                        leg_match = False
-                        break
-                if not leg_match:
-                    self._reconciliation_mismatch = True
-                    self.log.warning(
-                        f"BOOK_RECONCILIATION_MISMATCH: trade {key} ({trade.get('combo')}) "
-                        f"open_lots={trade.get('open_lots')} has no matching broker position"
-                    )
+                self._reconciliation_mismatch = True
+                self.log.warning(
+                    f"BOOK_RECONCILIATION_MISMATCH: trade {key} ({trade.get('combo')}) "
+                    f"open_lots={trade.get('open_lots')} has no matching broker position"
+                )
 
         for trade in self.book.trades.values():
             self._ensure_leg_subscriptions(trade["legs"])
@@ -423,6 +415,7 @@ class VrpEngine:
                 new_mid_price=mid,
                 new_natural_price=natural,
                 parent_order_id=wo.parent_id,
+                rv_20d=self._last_rv_20d,
             )
             for act in actions:
                 if act["action"] == "MODIFY_LIMIT" and self.gateway.modify_price(key, act["new_limit"]):
@@ -619,6 +612,7 @@ class VrpEngine:
             raw_rv = rv_snap.get("rv_20d") if isinstance(rv_snap, dict) else None
             if is_number(raw_rv) and math.isfinite(float(raw_rv)) and float(raw_rv) > 0.0:
                 rv_20d = float(raw_rv)
+                self._last_rv_20d = rv_20d
             else:
                 self._rv_block_reason = "RV_MISSING_OR_INVALID"
         else:
@@ -659,6 +653,7 @@ class VrpEngine:
             "working_orders": self.working_rows(),
             "open_book": self.book.rows(),
             "exit_signals": exit_signals,
+            "book_reconciliation_alert": any(c >= 2 for c in self._not_confirmed_count.values()),
             "ts_ns": wall_ns,
             "event_ts_ns": event_ts_ns,
         }

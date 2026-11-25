@@ -323,3 +323,7 @@ class FakeStrategyPorts(FakeActorPorts):
 
     def cancel(self, order: Any) -> None:
         self.cancelled.append(order)
+
+    def orders_open(self) -> list[Any]:
+        """All open orders that are in the orders dict and have is_open == True."""
+        return [o for o in self.orders.values() if getattr(o, "is_open", True)]
