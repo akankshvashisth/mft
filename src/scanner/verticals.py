@@ -70,6 +70,70 @@ def adjacent_verticals(
             pairs.append(pair)
     return pairs
 
+def delta_targeted_verticals(
+    puts: Sequence[Row],
+    calls: Sequence[Row],
+    spot: float,
+    *,
+    short_delta_range: tuple[float, float] = (0.15, 0.30),
+    min_width_usd: float = 2.50,
+    min_width_pct_spot: float = 0.04,
+    max_width_pct_spot: float = 0.12,
+    min_mid_credit: float = 0.0,
+    max_width: float = MAX_VERTICAL_WIDTH,
+) -> list[VerticalPair]:
+    """Delta-targeted vertical spreads: pairs whose short-leg delta and spread width are in range.
+
+    Unlike ``adjacent_verticals`` which only pairs consecutive strikes, this function considers all
+    (short_i, long_j) pairs for i > j where the short leg's delta (approximated by moneyness) is
+    inside ``short_delta_range`` and the strike width is within the configured bounds.
+
+    ``short_delta_range`` refers to the short leg's absolute moneyness ``|strike - spot| / strike``
+    (or delta from ``extrinsic_value`` when available).  This excludes deep-OTM / deep-ITM legs that
+    have poor risk/friction ratios on mid-caps and avoids $1-wide spreads on $35 symbols.
+
+    Returns empty list when no pair satisfies all constraints.
+    """
+    pairs: list[VerticalPair] = []
+    for i in range(1, len(puts)):
+        for j in range(0, i):
+            short, wing = puts[i], puts[j]
+            width = float(short["strike"]) - float(wing["strike"])
+            if width <= 0 or width > max_width:
+                continue
+            width_pct = width / spot
+            if width_pct < min_width_pct_spot or width_pct > max_width_pct_spot:
+                continue
+            # Short-leg delta approximation via moneyness proxy
+            short_strike = float(short["strike"])
+            moneyness = abs(short_strike - spot) / max(short_strike, 1.0)
+            if moneyness < short_delta_range[0] or moneyness > short_delta_range[1]:
+                continue
+            # Width in $USD must be >= min_width_usd (e.g. $2.50 on a $35 symbol)
+            if width < min_width_usd:
+                continue
+            pair = _pair(BULL_PUT_SPREAD, short, wing, width, max_width, min_mid_credit)
+            if pair is not None:
+                pairs.append(pair)
+    for i in range(0, len(calls) - 1):
+        for j in range(i + 1, len(calls)):
+            short, wing = calls[i], calls[j]
+            width = float(wing["strike"]) - float(short["strike"])
+            if width <= 0 or width > max_width:
+                continue
+            width_pct = width / spot
+            if width_pct < min_width_pct_spot or width_pct > max_width_pct_spot:
+                continue
+            short_strike = float(short["strike"])
+            moneyness = abs(short_strike - spot) / max(short_strike, 1.0)
+            if moneyness < short_delta_range[0] or moneyness > short_delta_range[1]:
+                continue
+            if width < min_width_usd:
+                continue
+            pair = _pair(BEAR_CALL_SPREAD, short, wing, width, max_width, min_mid_credit)
+            if pair is not None:
+                pairs.append(pair)
+    return pairs
 
 def vertical_name(symbol: str, pair: VerticalPair) -> str:
     strikes = f"{int(pair.short['strike'])}/{int(pair.long['strike'])}"

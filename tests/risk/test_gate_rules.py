@@ -315,3 +315,19 @@ def test_zero_incremental_tail_risk_is_rejected():
 
     check = es_budget_check(400.0, float("nan"), 5, CFG)
     assert (check.capped_qty, check.reasons) == (0, ["INVALID_INCREMENTAL_ES99"])
+def test_daemon_invalid_timestamp():
+    """Far-future evaluated_at_ns (age < -5 sec) -> RISK_DAEMON_INVALID_TIMESTAMP."""
+    reason = daemon_block_reason("0", {"evaluated_at_ns": NOW_NS + 10 * 1_000_000_000}, NOW_NS, 30.0)
+    assert reason == "RISK_DAEMON_INVALID_TIMESTAMP"
+
+
+def test_futures_check_on_non_index_etf_returns_clean():
+    """futures_check(is_index_etf=False) returns ([], []) without warnings."""
+    reasons, warnings = futures_check({}, NOW_NS, CFG, is_index_etf=False)
+    assert (reasons, warnings) == ([], [])
+
+
+def test_futures_check_on_index_etf_behaves_normally():
+    """futures_check(is_index_etf=True, default) still emits FUTURES_CROSS_CHECK_UNAVAILABLE as warning."""
+    reasons, warnings = futures_check({}, NOW_NS, CFG, is_index_etf=True)
+    assert warnings == ["FUTURES_CROSS_CHECK_UNAVAILABLE"]

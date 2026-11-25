@@ -28,6 +28,11 @@ class RiskDaemonConfig:
     vix_ratio_halt_threshold: float = 1.0
     surface_keys: tuple[str, ...] = (keys.surface_key("SPY.ARCA"),)
     rv_keys: tuple[str, ...] = (keys.rv_key("SPY.ARCA"),)
+    # Account / PM margin cliff checks
+    min_pm_nlv_usd: float = 105_000.0
+    min_margin_cushion: float = 0.25
+    max_account_age_sec: float = 120.0
+    require_account_snapshot: bool = False
     history_max_len: int = 2000
     transitions_max_len: int = 500
     jsonl_path: str = "logs/risk_history.jsonl"
@@ -58,6 +63,7 @@ class RiskInputs:
     positions: Payload | None = None
     surfaces: Mapping[str, Payload | None] = field(default_factory=dict)
     rvs: Mapping[str, Payload | None] = field(default_factory=dict)
+    account: Payload | None = None
 
 
 def state_ttl_ms(cfg: RiskDaemonConfig) -> int:
@@ -161,6 +167,29 @@ def evaluate_risk(inputs: RiskInputs, cfg: RiskDaemonConfig, now_ns: int) -> Ris
         age = age_of(rv_key, rv)
         if age is not None and age > cfg.max_rv_age_sec:
             flag(f"stale_rv:{rv_key}", f"{age:.0f}s")
+
+    # 6. Account / Portfolio Margin cliff check
+    account = inputs.account
+    account_check_active = account is not None or cfg.require_account_snapshot
+    if account_check_active:
+        if account is None:
+            flag("missing_account_snapshot")
+        else:
+            acct_age = age_of("mft:account:latest", account)
+            if acct_age is not None and acct_age > cfg.max_account_age_sec:
+                flag("stale_account_snapshot", f"{acct_age:.1f}s")
+            # PM NLV buffer breach
+            raw_nlv = account.get("nlv_usd")
+            if not is_number(raw_nlv):
+                flag("invalid_pm_nlv")
+            elif float(raw_nlv) < cfg.min_pm_nlv_usd:
+                flag("pm_nlv_buffer_breach", f"{raw_nlv}<{cfg.min_pm_nlv_usd}")
+            # Margin cushion breach
+            raw_cushion = account.get("cushion")
+            if not is_number(raw_cushion):
+                flag("invalid_margin_cushion")
+            elif float(raw_cushion) < cfg.min_margin_cushion:
+                flag("margin_cushion_breach", f"{raw_cushion}<{cfg.min_margin_cushion}")
 
     return RiskEvaluation(
         halted=len(reasons) > 0,

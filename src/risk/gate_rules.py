@@ -33,7 +33,10 @@ def daemon_block_reason(
     now_ns: int,
     max_status_age_secs: float,
 ) -> str | None:
-    """Fail-closed daemon check: requires halted == "0" and a recent, non-halted evaluation."""
+    """Fail-closed daemon check: requires halted == "0" and a recent, non-halted evaluation.
+
+    Rejects far-future ``evaluated_at_ns`` (age_secs < -5.0) as ``RISK_DAEMON_INVALID_TIMESTAMP``.
+    """
     if halted_text is None or halted_text.strip() != "0":
         return "RISK_DAEMON_HALTED_OR_MISSING"
     status = status or {}
@@ -41,6 +44,8 @@ def daemon_block_reason(
     if not is_number(evaluated_ns):
         return "RISK_DAEMON_HALTED_OR_MISSING"
     age_secs = (now_ns - float(evaluated_ns)) / NS_PER_SEC
+    if age_secs < -5.0:
+        return "RISK_DAEMON_INVALID_TIMESTAMP"
     if age_secs > max_status_age_secs:
         return f"RISK_DAEMON_STALE({age_secs:.0f}s)"
     if status.get("halted") is not False:
@@ -76,8 +81,14 @@ def metrics_reasons(metrics: Payload, now_ns: int, max_age_secs: float) -> list[
     return []
 
 
-def futures_check(futures: Payload, now_ns: int, cfg: GateConfig) -> tuple[list[str], list[str]]:
-    """(reasons, warnings). Futures context is advisory: only a valid, fresh cross-check can block."""
+def futures_check(futures: Payload, now_ns: int, cfg: GateConfig, is_index_etf: bool = True) -> tuple[list[str], list[str]]:
+    """(reasons, warnings). Futures context is advisory: only a valid, fresh cross-check can block.
+
+    When ``is_index_etf`` is ``False`` (e.g. single-name mid-caps without listed futures),
+    the check returns ``([], [])`` cleanly without spamming ``FUTURES_CROSS_CHECK_UNAVAILABLE``.
+    """
+    if not is_index_etf:
+        return [], []
     diff_bps = futures.get("parity_vs_fut_diff_bps")
     if snapshot_is_fresh(futures, now_ns, cfg.max_input_age_secs) and futures.get("cross_check_valid") and is_number(diff_bps):
         if abs(float(diff_bps)) > cfg.max_parity_fut_diff_bps:
