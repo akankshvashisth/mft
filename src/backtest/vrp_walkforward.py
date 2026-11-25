@@ -347,22 +347,23 @@ def run_midcap_vrp_backtest(
             "entry_credit": mid_credit,
         })
 # --- Force-close trades still open at simulation end --------------------------------------------
-    last_group = grouped[-1]
-    last_df = last_group[1]
-    for t in open_trades:
-        # Try quote-based exit first
-        exit_debit, is_fallback = compute_exit_debit(last_df, t["short_strike"], t["long_strike"], exit_slippage_frac)
-        if is_fallback:
-            last_spot = float(last_df["spot"].iloc[0])
-            last_iv = float(last_df["atm_iv"].iloc[0])
+    if open_trades and grouped:
+        last_group = grouped[-1]
+        last_df = last_group[1]
+        for t in open_trades:
+            # Try quote-based exit first
+            exit_debit, is_fallback = compute_exit_debit(last_df, t["short_strike"], t["long_strike"], exit_slippage_frac)
             days_held = (grouped_dates[-1] - t["entry_date"]).days
-            ttm_remaining = max(TARGET_DTE_DAYS - days_held, 1.0)
-            exit_debit = bsm_fallback_exit_debit(
-                t["short_strike"], t["long_strike"], last_spot, last_iv,
-                ttm_remaining, exit_slippage_frac,
-            )
-            fallback_exit_marks += 1
-        pnl = (t["entry_fill"] - exit_debit) * 100.0 * t["lots"] - commission_per_lot * t["lots"]
+            if is_fallback:
+                last_spot = float(last_df["spot"].iloc[0])
+                last_iv = float(last_df["atm_iv"].iloc[0])
+                ttm_remaining = max(TARGET_DTE_DAYS - days_held, 1.0)
+                exit_debit = bsm_fallback_exit_debit(
+                    t["short_strike"], t["long_strike"], last_spot, last_iv,
+                    ttm_remaining, exit_slippage_frac,
+                )
+                fallback_exit_marks += 1
+            pnl = (t["entry_fill"] - exit_debit) * 100.0 * t["lots"] - commission_per_lot * t["lots"]
         trades.append({
             **t, "pnl_usd": round(pnl, 2), "exit_reason": TIME_STOP,
             "exit_debit": exit_debit, "exit_date": grouped_dates[-1],
@@ -379,16 +380,16 @@ def run_midcap_vrp_backtest(
 
     total_return = equity - sleeve_equity_usd
     total_friction_usd = commission_per_lot * float(np.sum([t["lots"] for t in trades])) if trades else 0.0
-    # Add estimated entry + exit spread slippage: (2 * slippage_frac * half_spread) per trade
+    # Entry + exit spread slippage: credit given up by stepping inside from mid on entry,
+    # plus extra debit paid by not closing at mid on exit.
     for t in trades:
-        width = t.get("width", 0.0)
-        if width > 0:
-            entry_debit = t["entry_fill"]
-            exit_debit = t.get("exit_debit", 0.0)
-            # Half-spread ≈ width * 0.03 (typical mid-cap option spread); use a simple proxy
-            est_half_spread = width * 0.03
-            slippage_cost = 2.0 * exit_slippage_frac * est_half_spread * 100.0 * t["lots"]
-            total_friction_usd += slippage_cost
+        entry_credit = t.get("entry_credit", 0.0)
+        entry_fill = t.get("entry_fill", 0.0)
+        exit_debit = t.get("exit_debit", 0.0)
+        entry_spread = max(0.0, entry_credit - entry_fill)
+        exit_spread = max(0.0, exit_debit - entry_credit)  # Approximates exit_mid erosion
+        # Use close_mid estimate from entry_credit for round-trip
+        total_friction_usd += (entry_spread + exit_spread) * 100.0 * t["lots"]
     avg_hold = float(np.mean([t.get("holding_calendar_days", 0) for t in trades])) if trades else 0.0
 
     if n >= 2 and float(np.std(pnls)) > 0:

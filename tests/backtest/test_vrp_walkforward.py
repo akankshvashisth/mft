@@ -208,12 +208,15 @@ def test_calendar_day_stop_across_weekend():
 
     14 calendar days from entry fires even though only ~10 trading days have passed due to weekends.
     Entry day 0 (Mon 2026-01-05), exit happens on day 14 (Mon 2026-01-19) at TIME_STOP.
+    Weekends are skipped so the df has fewer rows than calendar days.
     """
     MON_START = date(2026, 1, 5)
     quotes = {80.0: (0.48, 0.52), 85.0: (0.95, 1.05), 90.0: (1.90, 2.10)}
     rows = []
     for d in range(15):
         dt = MON_START + timedelta(days=d)
+        if dt.weekday() >= 5:  # Skip weekends
+            continue
         for strike, (bid, ask) in sorted(quotes.items()):
             rows.append({
                 "date": dt.isoformat(), "spot": 100.0, "rv_20d": 0.15, "atm_iv": 0.20,
@@ -230,6 +233,29 @@ def test_calendar_day_stop_across_weekend():
     assert summary["exits_by_reason"].get(TIME_STOP, 0) >= 1
     assert summary["fallback_exit_marks"] == 0
 
+
+def test_force_close_with_live_quotes_on_short_chain():
+    """5-day chain where a trade is still open on the last day, but live quotes exist -> force-close uses quotes.
+
+    Chain has 5 days (range 0-4). Entry on day 0, trade stays open (5 days < 14 holding limit).
+    On day 4 (last day), force-close runs: quotes exist, so no BSM fallback needed.
+    """
+    quotes = {80.0: (0.48, 0.52), 85.0: (0.95, 1.05), 90.0: (1.90, 2.10)}
+    rows = []
+    for d in range(5):
+        for strike, (bid, ask) in sorted(quotes.items()):
+            rows.append({
+                "date": (START + timedelta(days=d)).isoformat(),
+                "spot": 100.0, "rv_20d": 0.15, "atm_iv": 0.20,
+                "right": "P", "strike": strike, "bid": bid, "ask": ask,
+                "mid": round(0.5 * (bid + ask), 4), "iv": 0.2,
+            })
+    df = pd.DataFrame(rows)
+    pricer = FakePricer(lambda combo: risk_assessment(recommended_contracts=2, approved=True))
+    summary = run(df, pricer=pricer, max_concurrent_trades=1)
+    assert summary["completed_trades"] == 1
+    assert summary["fallback_exit_marks"] == 0
+    assert summary["avg_holding_calendar_days"] == pytest.approx(4.0, abs=0.5)
 
 def test_gate_parity_checks():
     """_gate_parity_checks returns reason codes when conditions are violated."""
