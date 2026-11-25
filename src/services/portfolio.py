@@ -14,7 +14,7 @@ from src.common.log import LogLike
 from src.common.market import OptionSpec, QuoteObs, symbol_of
 from src.common.store import JsonStore, NullStore
 from src.common.timeutil import ny_date
-from src.quant.risk_measures import parametric_book_var_es
+from src.quant.risk_measures import parametric_book_var_es, portfolio_horizon_var_es
 from src.services.portfolio_marks import (
     GREEK_KEYS,
     SPOT_SHOCKS_PCT,
@@ -202,6 +202,7 @@ class PortfolioService:
         session_realized_usd = closed_realized_usd + sum(float(p.realized_pnl) for p in positions)
         legs_spec: list[dict] = []
         position_rows: list[dict] = []
+        unmodeled_positions: list[str] = []
 
         for pos in positions:
             iid = str(pos.instrument_id)
@@ -246,6 +247,7 @@ class PortfolioService:
                 mark_px = live_mid if live_mid is not None else avg_px
                 mark_source = "UNMODELED_SPREAD"
                 pos_pnl = signed_qty * info.multiplier * (mark_px - avg_px)
+                unmodeled_positions.append(iid)
             else:
                 mult = info.multiplier if info is not None else 1.0
                 mark_px = self.live_mid(iid, now_ns)
@@ -307,9 +309,17 @@ class PortfolioService:
         stress_grid = book_stress_grid(legs_spec, self.settings.risk_free_rate)
         worst_stress_usd = float(np.min(stress_grid))
 
-        # Approximate P-measure 1-day 99% VaR / ES from book Delta/Gamma/Vega + RV20
+        # 14-day nonlinear portfolio Monte Carlo ES99 (same horizon as ScenarioPricer)
+        book_var_99_usd, book_es_99_usd = portfolio_horizon_var_es(
+            legs_spec,
+            horizon_days=14.0,
+            r=self.settings.risk_free_rate,
+            n_scenarios=5_000,
+            seed=42,
+        )
+        # Keep 1-day linear parametric as a secondary diagnostic
         rv_20d = float(bench_rv.get("rv_20d") or bench_atm_iv)
-        book_var_99_usd, book_es_99_usd = parametric_book_var_es(beta_delta_shares, net_vega_1v, bench_spot, rv_20d)
+        book_1d_linear_var_99_usd, book_1d_linear_es_99_usd = parametric_book_var_es(beta_delta_shares, net_vega_1v, bench_spot, rv_20d)
 
         # Sleeve equity is decoupled from IBKR NLV: allocated capital + this book's P&L
         sleeve = self.sleeve.snapshot(realized_pnl_usd, unrealized_pnl_usd, len(positions), now_ns)
@@ -333,6 +343,10 @@ class PortfolioService:
             "risk": {
                 "book_var_99_usd": book_var_99_usd,
                 "book_es_99_usd": book_es_99_usd,
+                "book_1d_linear_var_99_usd": book_1d_linear_var_99_usd,
+                "book_1d_linear_es_99_usd": book_1d_linear_es_99_usd,
+                "unmodeled_positions": unmodeled_positions,
+                "has_unmodeled_positions": bool(unmodeled_positions),
                 "worst_7d_stress_usd": round(worst_stress_usd, 2),
                 "spot_shocks_pct": list(SPOT_SHOCKS_PCT),
                 "vol_shocks_pts": list(VOL_SHOCKS_PTS),

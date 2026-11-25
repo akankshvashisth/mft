@@ -5,6 +5,7 @@ their order stable because the strategy and dashboard display them.
 """
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -98,6 +99,9 @@ def portfolio_reasons(portfolio: Payload, now_ns: int, max_age_secs: float) -> l
         return ["PORTFOLIO_RISK_MISSING_OR_STALE"]
     if _book_es99_or_none(portfolio) is None:
         return ["PORTFOLIO_RISK_INVALID"]
+    risk = portfolio.get("risk")
+    if isinstance(risk, dict) and risk.get("has_unmodeled_positions"):
+        return ["PORTFOLIO_HAS_UNMODELED_POSITIONS"]
     return []
 
 
@@ -233,14 +237,18 @@ def es_budget_check(
     max_es99_usd = cfg.sleeve_equity_usd * cfg.max_book_es99_pct
     remaining_es99 = max(0.0, max_es99_usd - current_es99_usd)
 
-    if incremental_es99_per_lot_usd > 0.0:
-        es_qty_cap = int(remaining_es99 // incremental_es99_per_lot_usd)
-        if es_qty_cap <= 0:
-            reasons.append(
-                f"SLEEVE_ES99_BUDGET_EXHAUSTED(cur=${current_es99_usd:.0f}+${incremental_es99_per_lot_usd:.0f}"
-                f">${max_es99_usd:.0f})"
-            )
-        elif es_qty_cap < capped_qty:
+    # Fail-closed: invalid (zero, negative, non-finite) incremental ES99 blocks entry
+    if not math.isfinite(incremental_es99_per_lot_usd) or incremental_es99_per_lot_usd <= 0.0:
+        reasons.append("INVALID_INCREMENTAL_ES99")
+        return EsBudgetCheck(capped_qty=0, reasons=reasons, warnings=warnings, projected_es99_usd=current_es99_usd)
+
+    es_qty_cap = int(remaining_es99 // incremental_es99_per_lot_usd)
+    if es_qty_cap <= 0:
+        reasons.append(
+            f"SLEEVE_ES99_BUDGET_EXHAUSTED(cur=${current_es99_usd:.0f}+${incremental_es99_per_lot_usd:.0f}"
+            f">${max_es99_usd:.0f})"
+        )
+    elif es_qty_cap < capped_qty:
             capped_qty = es_qty_cap
             warnings.append(f"QTY_CAPPED_BY_ES99({es_qty_cap} lots)")
 

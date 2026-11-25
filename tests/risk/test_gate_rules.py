@@ -152,6 +152,12 @@ def test_fresh_but_unreadable_book_es99_blocks(payload):
     assert book_es99_usd(payload) == 0.0
 
 
+def test_unmodeled_positions_block_entry():
+    """has_unmodeled_positions=True in the portfolio payload blocks entry."""
+    payload = portfolio_payload(risk={"book_es_99_usd": 100.0, "has_unmodeled_positions": True})
+    assert portfolio_reasons(payload, NOW_NS, 120.0) == ["PORTFOLIO_HAS_UNMODELED_POSITIONS"]
+
+
 # --- Order-rate throttle ---------------------------------------------------------------------------
 
 
@@ -299,7 +305,13 @@ def test_es_budget_exhausted(current):
     assert check.reasons == [f"SLEEVE_ES99_BUDGET_EXHAUSTED(cur=${current:.0f}+$300>$1000)"]
 
 
-def test_zero_incremental_tail_risk_is_not_capped():
+def test_zero_incremental_tail_risk_is_rejected():
+    """Zero or negative incremental ES99 is fail-closed with INVALID_INCREMENTAL_ES99."""
     check = es_budget_check(400.0, 0.0, 5, CFG)
-    assert (check.capped_qty, check.reasons, check.warnings) == (5, [], [])
-    assert check.projected_es99_usd == pytest.approx(400.0)
+    assert (check.capped_qty, check.reasons) == (0, ["INVALID_INCREMENTAL_ES99"])
+
+    check = es_budget_check(400.0, -1.0, 5, CFG)
+    assert (check.capped_qty, check.reasons) == (0, ["INVALID_INCREMENTAL_ES99"])
+
+    check = es_budget_check(400.0, float("nan"), 5, CFG)
+    assert (check.capped_qty, check.reasons) == (0, ["INVALID_INCREMENTAL_ES99"])

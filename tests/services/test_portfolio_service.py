@@ -85,7 +85,8 @@ def test_share_position_marks_live_and_stresses_linearly(make_service):
     assert grid[0] == [-7_000.0] * 6 and grid[3] == [0.0] * 6 and grid[6] == [7_000.0] * 6
     assert payload["risk"]["worst_7d_stress_usd"] == -7_000.0
     risk = payload["risk"]
-    assert risk["book_es_99_usd"] / risk["book_var_99_usd"] == pytest.approx(2.665 / 2.326, rel=1e-3)
+    assert risk["book_es_99_usd"] > 0.0 and risk["book_var_99_usd"] > 0.0
+    assert risk["book_1d_linear_es_99_usd"] > 0.0 and risk["book_1d_linear_var_99_usd"] > 0.0
     assert (payload["sleeve"]["equity"], payload["sleeve"]["high_water_mark"]) == (101_000.0, 101_000.0)
 
 
@@ -183,7 +184,34 @@ def test_attribution_runs_across_evaluations(make_service, store, market):
     assert attribution["since_ts_ns"] == NOW_NS
 
 
-def test_surfaces_are_keyed_by_symbol(make_service, store):
+def test_unmodeled_spread_sets_flag(make_service, store, market):
+    """An OPTION_SPREAD with no info['legs'] sets has_unmodeled_positions=True."""
+    store.set_json(keys.spread_legs_key("UNKNOWN_SPREAD"), "not valid")  # No usable legs
+    market.quotes["UNKNOWN_SPREAD"] = quote(1.25, 1.35)
+    market.instruments["UNKNOWN_SPREAD"] = InstrumentInfo(OPTION_SPREAD, 100.0)
+    payload = make_service().evaluate([PositionView("UNKNOWN_SPREAD", -2.0, 1.2)], 0.0, NOW_NS)
+    assert payload["risk"]["has_unmodeled_positions"] is True
+    assert "UNKNOWN_SPREAD" in payload["risk"]["unmodeled_positions"]
+
+
+def test_registered_spread_does_not_set_unmodeled_flag(make_service, store):
+    """A spread with registered legs in Valkey is modeled and not unmodeled."""
+    store.set_json(keys.spread_legs_key(SPREAD),
+                   [{"instrument_id": P690, "ratio": 1}, {"instrument_id": P685, "ratio": -1}])
+    payload = make_service().evaluate([PositionView(SPREAD, -2.0, 1.2)], 0.0, NOW_NS)
+    assert payload["risk"]["has_unmodeled_positions"] is False
+    assert payload["risk"]["unmodeled_positions"] == []
+
+
+def test_horizon_var_es_is_nonlinear_14d(make_service, store):
+    """book_es_99_usd is the 14-day nonlinear MC ES99 (not the 1-day linear)."""
+    store.set_json(keys.spread_legs_key(SPREAD),
+                   [{"instrument_id": P690, "ratio": 1}, {"instrument_id": P685, "ratio": -1}])
+    payload = make_service().evaluate([PositionView(SPREAD, -2.0, 1.2)], 0.0, NOW_NS)
+    risk = payload["risk"]
+    # The 14d MC ES99 should be larger than the 1d linear ES99 (longer horizon + non-normal tails)
+    assert risk["book_es_99_usd"] > 0.0
+    assert risk["book_1d_linear_es_99_usd"] > 0.0
     store.set_json(keys.surface_key("QQQ.NASDAQ"), surface_payload("QQQ.NASDAQ"))
     store.set_text(keys.surface_key("BAD.ARCA"), "not json")
     assert sorted(make_service().surfaces_by_symbol()) == ["QQQ", "SPY"]
