@@ -212,6 +212,37 @@ def test_horizon_var_es_is_nonlinear_14d(make_service, store):
     # The 14d MC ES99 should be larger than the 1d linear ES99 (longer horizon + non-normal tails)
     assert risk["book_es_99_usd"] > 0.0
     assert risk["book_1d_linear_es_99_usd"] > 0.0
+
+
+def test_surfaces_are_keyed_by_symbol(make_service, store):
     store.set_json(keys.surface_key("QQQ.NASDAQ"), surface_payload("QQQ.NASDAQ"))
     store.set_text(keys.surface_key("BAD.ARCA"), "not json")
     assert sorted(make_service().surfaces_by_symbol()) == ["QQQ", "SPY"]
+
+
+def test_defined_risk_credit_spread_es99_is_bounded(make_service, store, market):
+    """A 1-lot $5-wide credit spread (e.g. 690/685 put) has book_es_99_usd inside [0, 500]."""
+    store.set_json(keys.spread_legs_key(SPREAD),
+                   [{"instrument_id": P690, "ratio": 1}, {"instrument_id": P685, "ratio": -1}])
+    payload = make_service().evaluate([PositionView(SPREAD, -1.0, 0.6)], 0.0, NOW_NS)
+    es = payload["risk"]["book_es_99_usd"]
+    # A bull put spread's max loss is width * 100 = $500. 14d MC ES should be positive but under that.
+    assert 0.0 < es <= 500.0, f"ES99 ${es:.2f} outside expected (0, 500] range"
+    assert payload["risk"]["book_var_99_usd"] > 0.0
+
+
+def test_beta_hedged_short_gamma_produces_tail_risk(make_service, store, market):
+    """A delta-hedged short strangle (beta_delta_shares ≈ 0) still has positive book_es_99_usd (gamma + idio)."""
+    store.set_json(keys.spread_legs_key(SPREAD),
+                   [{"instrument_id": P690, "ratio": 1}, {"instrument_id": P685, "ratio": -1}])
+    market.instruments["SPY.ARCA"] = InstrumentInfo(OTHER, 1.0)
+    # Short 2-lot put spread (bearish delta ≈ -2 * ~0.20 = -0.4) + long SPY shares to offset delta
+    payload = make_service().evaluate([
+        PositionView(SPREAD, -2.0, 0.6),
+        PositionView("SPY.ARCA", 40.0, 700.0),
+    ], 0.0, NOW_NS)
+    # Beta-hedged: beta_delta ≈ net delta * (spot / bench_spot) should be near zero
+    beta_delta = payload["greeks"]["beta_delta_shares"]
+    assert abs(beta_delta) < 200.0, f"Beta-delta {beta_delta:.1f} not near zero"
+    # Short gamma still generates tail risk
+    assert payload["risk"]["book_es_99_usd"] > 0.0, "Hedged position produces no tail risk"

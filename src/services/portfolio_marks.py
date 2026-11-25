@@ -80,6 +80,7 @@ def option_exposure(
             "charm_day": notional_qty * g["charm_day"],
         },
         "stress_leg": {
+            "underlying": str(option.underlying),
             "is_option": True,
             "signed_qty": qty,
             "multiplier": multiplier,
@@ -95,7 +96,7 @@ def option_exposure(
 
 
 def linear_stress_leg(signed_qty: float, multiplier: float, price: float) -> dict[str, Any]:
-    return {"is_option": False, "signed_qty": signed_qty, "multiplier": multiplier, "spot": price}
+    return {"underlying": "", "is_option": False, "signed_qty": signed_qty, "multiplier": multiplier, "spot": price}
 
 
 def stress_leg_pnl(leg: Payload, spot_mult: float, vol_shift: float, dt_years: float, r: float) -> float:

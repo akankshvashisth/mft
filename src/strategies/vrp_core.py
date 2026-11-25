@@ -21,7 +21,6 @@ from src.scanner.verticals import VerticalPair, adjacent_verticals, split_by_rig
 ENTRY = "ENTRY"
 EXIT = "EXIT"
 STRATEGY_MIN_CREDIT = 0.05
-DEFAULT_TOB_SIZE = 10
 POSITION_TOLERANCE = 1e-6
 
 Trade = dict[str, Any]
@@ -240,8 +239,13 @@ def enrich_surface_legs(
             continue
         bid = float(raw.get("bid") or 0.0)
         ask = float(raw.get("ask") or 0.0)
-        bid_size: int | None = None
-        ask_size: int | None = None
+        # Read surface snapshot bid_size/ask_size if present, otherwise None
+        bid_size: int | None = raw.get("bid_size")
+        if bid_size is not None:
+            bid_size = int(bid_size)
+        ask_size: int | None = raw.get("ask_size")
+        if ask_size is not None:
+            ask_size = int(ask_size)
 
         own = strategy_quote(instrument_id)
         if own is not None:

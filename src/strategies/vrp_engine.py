@@ -18,6 +18,7 @@ from src.common import keys
 from src.common.constants import DEFAULT_VALKEY_URL, SECS_PER_DAY
 from src.common.log import LogLike
 from src.common.market import OptionSpec, QuoteObs, symbol_of
+from src.common.numeric import is_number
 from src.common.quotes import combo_mid_natural
 from src.common.store import JsonStore
 from src.execution.passive_combo import CREDIT_OPEN, DEBIT_CLOSE, ChildClipOrder, PassiveComboExecutor
@@ -560,7 +561,7 @@ class VrpEngine:
         # Validate RV freshness and finiteness — fail closed
         if snapshot_is_fresh(rv_snap, wall_ns, SECS_PER_DAY):
             raw_rv = rv_snap.get("rv_20d") if isinstance(rv_snap, dict) else None
-            if isinstance(raw_rv, (int, float)) and math.isfinite(float(raw_rv)) and float(raw_rv) > 0.0:
+            if is_number(raw_rv) and math.isfinite(float(raw_rv)) and float(raw_rv) > 0.0:
                 rv_20d = float(raw_rv)
             else:
                 self._rv_block_reason = "RV_MISSING_OR_INVALID"

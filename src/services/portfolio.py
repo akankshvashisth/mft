@@ -53,6 +53,7 @@ class InstrumentInfo:
     kind: str                   # OPTION, OPTION_SPREAD or OTHER
     multiplier: float
     option: OptionSpec | None = None
+    spread_legs: tuple[tuple[str, int], ...] | None = None  # (instrument_id, ratio) pairs
 
 
 class BookMarket(Protocol):
@@ -132,7 +133,18 @@ class PortfolioService:
         return None
 
     def spread_option_legs(self, spread_id: str) -> list[tuple[InstrumentInfo, int]] | None:
-        """Leg (instrument, ratio) pairs registered by the strategy under mft:spread_legs:<spread id>."""
+        """Leg (instrument, ratio) pairs: prefer info.spread_legs, fall back to mft:spread_legs:<id>."""
+        # First check InstrumentInfo for embedded legs (from OptionSpread.info["legs"])
+        info = self.market.instrument(spread_id)
+        if info is not None and info.spread_legs:
+            legs: list[tuple[InstrumentInfo, int]] = []
+            for iid, ratio in info.spread_legs:
+                leg_info = self.market.instrument(iid)
+                if leg_info is None or leg_info.kind != OPTION or leg_info.option is None:
+                    return None
+                legs.append((leg_info, ratio))
+            return legs or None
+        # Fall back to Valkey-stored spread legs
         raw_legs = self.store.get_json_value(keys.spread_legs_key(spread_id))
         if not isinstance(raw_legs, list):
             return None

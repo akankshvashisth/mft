@@ -65,17 +65,17 @@ def portfolio_horizon_var_es(
 ) -> tuple[float, float]:
     """14-day nonlinear portfolio Monte Carlo 99% VaR and Expected Shortfall (both ≥ 0).
 
-    Simulates correlated 1-factor (market) + idiosyncratic spot shocks per underlying
-    over ``horizon_days`` (Student-:math:`t_5`, tail correlation 0.85 on market down-shocks)
-    and leverage-correlated IV shocks.  Every option leg is repriced nonlinearly via
-    Black-Scholes.  Linear legs (shares, futures) are revalued linearly.
+    Simulates correlated 1-factor (market) + idiosyncratic spot shocks per *underlying*
+    over ``horizon_days`` (Student-:math:`t_5`, tail correlation 0.85/0.40 on market
+    down/up moves) and leverage-correlated IV shocks.  Every option leg is repriced
+    nonlinearly via vectorised Black-Scholes.  Linear legs are revalued linearly.
 
     Parameters
     ----------
     legs_spec : list[dict]
-        Each dict must have keys ``is_option`` (bool), ``signed_qty`` (float),
-        ``multiplier`` (float), ``spot`` (float), and optionally ``strike``, ``ttm``,
-        ``q``, ``iv``, ``is_call`` for option legs.
+        Each dict must have keys ``underlying`` (str), ``is_option`` (bool),
+        ``signed_qty`` (float), ``multiplier`` (float), ``spot`` (float), and
+        optionally ``strike``, ``ttm``, ``q``, ``iv``, ``is_call``, ``theo_price``.
     horizon_days : float
         Risk horizon in calendar days.
     r : float
@@ -96,42 +96,80 @@ def portfolio_horizon_var_es(
 
     rng = np.random.default_rng(seed)
 
-    # Identify unique underlying spots (group legs by spot for shock generation)
-    spots = np.array([leg["spot"] for leg in legs_spec], dtype=np.float64)
+    # Group legs by underlying so both legs of a spread share the same spot path
+    underlying_keys: list[str] = []
+    group_indices: list[list[int]] = []
+    seen: dict[str, int] = {}
+    for i, leg in enumerate(legs_spec):
+        und = str(leg.get("underlying", ""))
+        idx = seen.get(und)
+        if idx is None:
+            idx = len(underlying_keys)
+            seen[und] = idx
+            underlying_keys.append(und)
+            group_indices.append([])
+        group_indices[idx].append(i)
+
+    n_und = len(underlying_keys)
     n_legs = len(legs_spec)
 
-    # Student-t 5 draws, scaled to unit variance sqrt((nu-2)/nu)
-    z_market = rng.standard_t(df=5, size=n_scenarios) * np.sqrt(3.0 / 5.0)  # unit variance
-    z_idio = rng.standard_t(df=5, size=(n_scenarios, n_legs)) * np.sqrt(3.0 / 5.0)
+    # Map each leg to its underlying group index
+    leg_to_und = np.zeros(n_legs, dtype=np.intp)
+    for und_idx, indices in enumerate(group_indices):
+        for i in indices:
+            leg_to_und[i] = und_idx
 
-    # Tail correlation: on market down-shocks (z_market < 0), mix 85% common + 15% idiosyncratic
-    rho_tail = 0.85
-    tail_mask = z_market < 0.0
-    for i in range(n_legs):
-        mix = np.where(tail_mask, rho_tail, 0.0)
-        z_idio[:, i] = mix * z_market + np.sqrt(1.0 - mix ** 2) * z_idio[:, i]
-
-    # Effective shock per leg: 1-factor loading = 1.0 (all equities), plus idiosyncratic
-    z_eff = z_market[:, np.newaxis] + z_idio
-
-    # Annualised vol for scaling (use a default 30% if iv not available)
-    vols = np.array(
-        [leg.get("iv", 0.30) if leg.get("is_option") else 0.30 for leg in legs_spec],
+    # Underlying-level arrays
+    und_spots = np.array(
+        [legs_spec[group_indices[i][0]]["spot"] for i in range(n_und)], dtype=np.float64
+    )
+    und_vols = np.array(
+        [
+            max(
+                legs_spec[group_indices[i][0]].get("iv", 0.30)
+                if legs_spec[group_indices[i][0]].get("is_option") else 0.30,
+                0.05,
+            )
+            for i in range(n_und)
+        ],
         dtype=np.float64,
     )
 
+    # Student-t 5 draws, scaled to unit variance sqrt(5/3)
+    scale_t = np.sqrt(3.0 / 5.0)
+    z_market = rng.standard_t(df=5, size=n_scenarios) * scale_t
+    z_idio = rng.standard_t(df=5, size=(n_scenarios, n_und)) * scale_t
+
+    # Factor shock: rho=0.85 on down moves, 0.40 on up moves
+    rho = np.where(z_market < 0.0, 0.85, 0.40)
+    # z_eff = rho * z_market + sqrt(1 - rho^2) * z_idio  (unit variance)
+    z_eff = (
+        rho[:, np.newaxis] * z_market[:, np.newaxis]
+        + np.sqrt(1.0 - rho[:, np.newaxis] ** 2) * z_idio
+    )
+
     # Spot simulation: GBM drift
-    drift = (r - 0.5 * vols ** 2) * dt_years
-    vol_scale = vols * np.sqrt(dt_years)
-    spot_sim = spots[np.newaxis, :] * np.exp(drift[np.newaxis, :] + vol_scale[np.newaxis, :] * z_eff)
+    drift = (r - 0.5 * und_vols ** 2) * dt_years
+    vol_scale = und_vols * np.sqrt(dt_years)
+    und_spot_sim = und_spots[np.newaxis, :] * np.exp(
+        drift[np.newaxis, :] + vol_scale[np.newaxis, :] * z_eff
+    )
 
     # IV shock: leverage effect (β=0.7) + vol-of-vol
     beta_lev = 0.7
-    vol_shock = -beta_lev * vol_scale[np.newaxis, :] * z_eff + 0.35 * vols[np.newaxis, :] * np.sqrt(dt_years) * rng.standard_normal(size=(n_scenarios, n_legs))
-    vol_sim = np.maximum(vols[np.newaxis, :] + vol_shock, 0.05)
+    vol_shock = (
+        -beta_lev * vol_scale[np.newaxis, :] * z_eff
+        + 0.35 * und_vols[np.newaxis, :] * np.sqrt(dt_years)
+        * rng.standard_normal(size=(n_scenarios, n_und))
+    )
+    und_vol_sim = np.maximum(und_vols[np.newaxis, :] + vol_shock, 0.05)
 
-    # Reprice each leg
-    from src.quant.black_scholes import bs_greeks
+    # Map underlying shocks to each leg
+    spot_sim = und_spot_sim[:, leg_to_und]
+    vol_sim = und_vol_sim[:, leg_to_und]
+
+    # Vectorised re-pricing
+    from src.quant.black_scholes import bsm_prices
 
     pnl = np.zeros(n_scenarios, dtype=np.float64)
     for i, leg in enumerate(legs_spec):
@@ -139,20 +177,16 @@ def portfolio_horizon_var_es(
         mult = float(leg["multiplier"])
         if not leg.get("is_option", False):
             # Linear leg
-            pnl += qty * mult * (spot_sim[:, i] - spots[i])
+            pnl += qty * mult * (spot_sim[:, i] - float(leg["spot"]))
         else:
-            # Option leg: reprice via Black-Scholes
             strike = float(leg["strike"])
-            ttm = max(float(leg.get("ttm", dt_years)) - dt_years, 1e-4)
+            rem_ttm = max(float(leg.get("ttm", dt_years)) - dt_years, 1e-4)
             is_call = bool(leg.get("is_call", True))
             q = float(leg.get("q", 0.0))
-            theo_price = float(leg.get("theo_price", 0.0))
-
-            scenario_pnl = np.zeros(n_scenarios, dtype=np.float64)
-            for j in range(n_scenarios):
-                g = bs_greeks(spot_sim[j, i], strike, ttm, r, q, vol_sim[j, i], is_call)
-                scenario_pnl[j] = g["price"] - theo_price
-            pnl += qty * mult * scenario_pnl
+            theo = float(leg.get("theo_price", 0.0))
+            flag = "c" if is_call else "p"
+            new_prices = bsm_prices(spot_sim[:, i], strike, rem_ttm, r, vol_sim[:, i], flag, q)
+            pnl += qty * mult * (new_prices - theo)
 
     # Compute VaR and ES from the P&L vector (loss = -pnl)
     loss = -pnl

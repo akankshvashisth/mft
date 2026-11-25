@@ -77,7 +77,7 @@ def test_sanitize_ohlc_removes_corrupt_bars():
 
 
 def test_sanitize_ohlc_quarantines_bad_ohlc():
-    """Bar with high < close or a 10x bad print is quarantined (no 758% RV spike)."""
+    """Bar with high < close or a 10x bad print is quarantined; next valid bar is NOT dropped."""
     df = daily_ohlc_frame(n=80, seed=11, daily_vol=0.01)
     # Insert a corrupt spike: high < close (intraday violation)
     bad_high = df.copy()
@@ -86,12 +86,30 @@ def test_sanitize_ohlc_quarantines_bad_ohlc():
     assert len(cleaned) == len(bad_high) - 1  # Exactly one row dropped
     assert yang_zhang_rv(cleaned, 20) == pytest.approx(yang_zhang_rv(df, 20), rel=0.5)
 
-    # Insert a 10x close spike
+    # Insert a 10x close spike (valid O=H=L=C=10x) - only the spike row is dropped
     bad_spike = df.copy()
-    bad_spike.loc[50, "close"] = bad_spike.loc[49, "close"] * 10.0
+    ten_x = bad_spike.loc[49, "close"] * 10.0
+    bad_spike.loc[50, ["open", "high", "low", "close"]] = ten_x  # Valid OHLC but 10x price
     cleaned2 = sanitize_ohlc(bad_spike)
-    assert len(cleaned2) == len(bad_spike) - 1  # Spike row dropped
+    assert len(cleaned2) == len(bad_spike) - 1  # Spike row dropped, next row kept
     assert yang_zhang_rv(cleaned2, 20) > 0.0 and yang_zhang_rv(cleaned2, 20) < 0.5  # No 758% RV
+    # Verify the row after the spike is still present (sequential check)
+    assert bad_spike.loc[51, "close"] in cleaned2["close"].values
+
+
+def test_trailing_rolling_rv_with_datetimeindex():
+    """trailing_rolling_rv works with a DatetimeIndex (not just RangeIndex)."""
+    df = daily_ohlc_frame(n=80, seed=13)
+    df.index = pd.date_range("2026-01-01", periods=len(df), freq="D")
+    result = trailing_rolling_rv(df, window=20, ann=252)
+    assert len(result) > 0
+    assert all(np.isfinite(result))
+    # Verify equivalence to the scalar version
+    scalar = np.array(
+        [yang_zhang_rv(df.iloc[:end], 20, 252) for end in range(21, len(df) + 1)],
+        dtype=np.float64,
+    )
+    np.testing.assert_allclose(result, scalar, atol=1e-10)
 
 
 # --- Bipower jump share ---------------------------------------------------------------------------

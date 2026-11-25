@@ -16,7 +16,8 @@ def sanitize_ohlc(df: pd.DataFrame, max_abs_log_ret: float = 0.45) -> pd.DataFra
     Applies three checks in order:
     1. Any of ``open``, ``high``, ``low``, ``close`` is non-finite or ≤ 0.
     2. OHLC consistency: ``high < max(open, close)`` or ``low > min(open, close)``.
-    3. Outlier spike: ``|ln(C_t / C_{t-1})| > max_abs_log_ret`` (skip first row).
+    3. Outlier spike: |ln(C_t / last_accepted_close)| > max_abs_log_ret checked *sequentially*
+       so a single 10x spike bar does not also drop the valid bar right after it.
     """
     required = ("open", "high", "low", "close")
     if df.empty or any(col not in df for col in required):
@@ -32,11 +33,16 @@ def sanitize_ohlc(df: pd.DataFrame, max_abs_log_ret: float = 0.45) -> pd.DataFra
     if len(df) < 2:
         return df
 
+    # Sequential outlier check: each row's close is compared to the *last accepted* close
     closes = df["close"].to_numpy(dtype=np.float64)
-    log_rets = np.abs(np.log(closes / np.concatenate([[closes[0]], closes[:-1]])))
-    outlier = np.zeros(len(df), dtype=bool)
-    outlier[1:] = log_rets[1:] > max_abs_log_ret
-    return df.loc[~outlier]
+    keep = np.ones(len(df), dtype=bool)
+    last_accepted = closes[0]
+    for i in range(1, len(df)):
+        if abs(np.log(closes[i] / last_accepted)) > max_abs_log_ret:
+            keep[i] = False  # drop this spike bar
+        else:
+            last_accepted = closes[i]  # only update on accepted rows
+    return df.loc[keep]
 
 
 def yang_zhang_rv(df: pd.DataFrame, window: int, ann: int = TRADING_DAYS_PER_YEAR) -> float:
@@ -155,28 +161,6 @@ def percentile_rank(
     return float(round(pct, decimals)) if decimals is not None else pct
 
 
-def _yz_rv_clean(sub: pd.DataFrame, window: int, ann: int) -> float:
-    """Internal YZ RV on a sanitised slice (assumes sub has at least 2 rows and valid OHLC)."""
-    if len(sub) < window + 1:
-        rets = np.log(sub["close"] / sub["close"].shift(1)).dropna()
-        return float(rets.std(ddof=1) * np.sqrt(ann)) if len(rets) > 1 else 0.0
-
-    prev_close = sub["close"].shift(1)
-    log_oc = np.log(sub["open"] / prev_close).iloc[1:]
-    log_co = np.log(sub["close"] / sub["open"]).iloc[1:]
-    log_ho = np.log(sub["high"] / sub["open"]).iloc[1:]
-    log_lo = np.log(sub["low"] / sub["open"]).iloc[1:]
-    log_hc = np.log(sub["high"] / sub["close"]).iloc[1:]
-    log_lc = np.log(sub["low"] / sub["close"]).iloc[1:]
-
-    rs = (log_ho * log_hc + log_lo * log_lc).mean()
-    var_o = log_oc.var(ddof=1)
-    var_c = log_co.var(ddof=1)
-    k = 0.34 / (1.34 + (window + 1) / max(window - 1, 1))
-    yz_var = max(float(var_o + k * var_c + (1.0 - k) * rs), 1e-10)
-    return float(np.sqrt(yz_var * ann))
-
-
 def trailing_rolling_rv(
     df: pd.DataFrame,
     window: int = 20,
@@ -194,13 +178,9 @@ def trailing_rolling_rv(
 
     # Pre-sanitize once
     clean = sanitize_ohlc(df)
-    if len(clean) < window + 1:
+    kept_idx = len(clean)
+    if kept_idx < window + 1:
         return np.array([], dtype=np.float64)
-
-    # Build mapping from original row positions to number of kept rows
-    kept = np.zeros(n + 1, dtype=np.intp)
-    kept[1:] = np.cumsum(np.isin(np.arange(n), clean.index.to_numpy()))
-    kept_idx = kept[n]  # total kept rows
 
     # Truncate to the last lookback windows
     first_kept = max(window + 1, kept_idx - lookback_val + 1)
@@ -208,7 +188,6 @@ def trailing_rolling_rv(
         return np.array([], dtype=np.float64)
 
     w = window
-    n_comp = kept_idx - 1  # number of usable log returns
     out_len = kept_idx - first_kept + 1
     result = np.empty(out_len, dtype=np.float64)
 
@@ -226,6 +205,7 @@ def trailing_rolling_rv(
     log_lc = np.log(l_arr[1:] / c_arr[1:])
 
     rs_t = log_ho * log_hc + log_lo * log_lc
+    n_comp = kept_idx - 1  # number of usable log returns
     # Use cumulative sums for O(1) per-window evaluation
     cs_oc = np.zeros(n_comp + 1, dtype=np.float64)
     cs_oc2 = np.zeros(n_comp + 1, dtype=np.float64)
@@ -250,8 +230,8 @@ def trailing_rolling_rv(
         sum_co2 = cs_co2[e] - cs_co2[s]
         sum_rs = cs_rs[e] - cs_rs[s]
 
-        var_o = (sum_oc2 - sum_oc ** 2 / cnt) / (cnt - 1.0)
-        var_c = (sum_co2 - sum_co ** 2 / cnt) / (cnt - 1.0)
+        var_o = max((sum_oc2 - sum_oc ** 2 / cnt) / (cnt - 1.0), 0.0)
+        var_c = max((sum_co2 - sum_co ** 2 / cnt) / (cnt - 1.0), 0.0)
         rs = sum_rs / cnt
 
         yz_var = max(float(var_o + k * var_c + (1.0 - k) * rs), 1e-10)
