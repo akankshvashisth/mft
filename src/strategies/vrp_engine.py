@@ -96,6 +96,13 @@ class OrderGateway(Protocol):
 
     def order_view(self, order_key: str) -> OrderView | None: ...
 
+    def open_order_keys(self) -> list[str]:
+        """All client order keys of pre-existing open orders (for crash restart reconciliation)."""
+        return []
+
+    def release(self, order_key: str) -> None:
+        """Prunes a finalized order key from internal bookkeeping (e.g. _client_ids)."""
+
 
 class MarketView(Protocol):
     def cache_quote(self, instrument_id: str) -> QuoteObs | None: ...
@@ -172,14 +179,50 @@ class VrpEngine:
         self._risk_check_mono: float = float("-inf")
         self._risk_block_reason: str | None = None
         self._rv_block_reason: str | None = None
+        self._reconciliation_mismatch: bool = False
+        self._not_confirmed_count: dict[str, int] = {}
 
     # --- Lifecycle -------------------------------------------------------------------------------
 
     def start(self) -> int:
-        """Subscribes to the configured options, restores the persisted book; returns open spreads."""
+        """Subscribes to the configured options, restores the persisted book; returns open spreads.
+
+        On startup:
+        1. Cancels any pre-existing open orders (orphaned DAY orders after a crash).
+        2. Reconciles the persisted book against broker positions.
+        """
         for option_id in self.settings.option_ids:
             self.market.ensure_subscribed(str(option_id))
         self.book = SpreadBook.from_json(self.store.get_json(self.book_key))
+
+        # Cancel orphaned open orders from a previous run
+        for orphan_key in self.gateway.open_order_keys():
+            self.gateway.cancel(orphan_key)
+            self.log.warning(f"Cancelled orphaned DAY order {orphan_key} on startup")
+
+        # Reconcile book trades against broker positions
+        self._reconciliation_mismatch = False
+        if self.settings.paper_routing_enabled:
+            net_qty = self.market.net_position_qty
+            for key, trade in list(self.book.trades.items()):
+                # Check spread-level match
+                if abs(net_qty(key) + float(trade.get("open_lots", 0.0))) < 1e-6:
+                    continue
+                # Check leg-level match
+                leg_match = True
+                for leg in trade["legs"]:
+                    leg_id = str(leg["instrument_id"])
+                    expected_leg = -float(trade["open_lots"]) * int(leg["ratio"])
+                    if abs(net_qty(leg_id) - expected_leg) > 1e-6:
+                        leg_match = False
+                        break
+                if not leg_match:
+                    self._reconciliation_mismatch = True
+                    self.log.warning(
+                        f"BOOK_RECONCILIATION_MISMATCH: trade {key} ({trade.get('combo')}) "
+                        f"open_lots={trade.get('open_lots')} has no matching broker position"
+                    )
+
         for trade in self.book.trades.values():
             self._ensure_leg_subscriptions(trade["legs"])
         return len(self.book)
@@ -282,6 +325,7 @@ class VrpEngine:
         else:
             self.executor.mark_clip_status(wo.clip_id, status)
         self.executor.discard_clip(wo.clip_id)
+        self.gateway.release(order_key)
 
     def _register_spread_legs(self, spread_id: str, legs: list[dict]) -> None:
         if spread_id in self._registered_spreads:
@@ -392,7 +436,7 @@ class VrpEngine:
         s = self.settings
         working_spreads = {wo.spread_key for wo in self.working.values()}
         net_qty = self.market.net_position_qty
-        mismatches = leg_mismatches(self.book.expected_leg_positions(), net_qty) if s.paper_routing_enabled else set()
+        mismatches = leg_mismatches(self.book, net_qty) if s.paper_routing_enabled else set()
         book_changed = False
 
         for key, trade in list(self.book.trades.items()):
@@ -426,6 +470,12 @@ class VrpEngine:
             elif not exit_confirmed(key, trade, mismatches, net_qty):
                 # Buying back a spread we may not hold would open the opposite position
                 signal["status"] = "POSITION_NOT_CONFIRMED_IN_CACHE"
+                self._not_confirmed_count[key] = self._not_confirmed_count.get(key, 0) + 1
+                if self._not_confirmed_count[key] >= 2:
+                    self.log.error(
+                        f"Book reconciliation alert for {key} ({trade.get('combo')}): "
+                        f"not confirmed {self._not_confirmed_count[key]} cycles"
+                    )
             else:
                 clip = self.executor.create_parent_plan(
                     underlying=str(s.underlying_id),
@@ -487,6 +537,8 @@ class VrpEngine:
     def current_entry_block_reason(self) -> str | None:
         if self._rv_block_reason is not None:
             return self._rv_block_reason
+        if self._reconciliation_mismatch:
+            return "BOOK_RECONCILIATION_MISMATCH"
         portfolio_ts_ns = 0
         if self._last_fill_wall_ns:
             portfolio_ts_ns = int(self.store.get_json(keys.PORTFOLIO_RISK).get("ts_ns") or 0)

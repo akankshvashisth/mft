@@ -184,6 +184,12 @@ class FakeOrderGateway:
         base.update(fields)
         self.views[order_key] = OrderView(**base)
 
+    def open_order_keys(self) -> list[str]:
+        return [k for k, v in self.views.items() if v.is_open]
+
+    def release(self, order_key: str) -> None:
+        pass
+
 
 class FakeMarket:
     """MarketView stand-in: cache quotes, option specs, net positions and subscriptions."""

@@ -89,16 +89,24 @@ class SleeveTracker:
 
     The in-memory cache only knows this session's realized P&L, so earlier realized P&L and the
     high-water mark are restored from the last published snapshot.
+
+    Idempotent across intraday restarts: ``session_realized_usd`` and ``session_date`` are persisted
+    alongside ``realized_carry_usd`` so a same-day restart does not double-count realized P&L.
     """
 
     def __init__(self, allocated_capital_usd: float) -> None:
         self.allocated_capital_usd = allocated_capital_usd
         self.realized_carry_usd = 0.0
         self.high_water_mark = 0.0
+        self.session_date: str = ""
+        self.session_realized_usd: float = 0.0
 
     def restore(self, previous: Mapping[str, Any]) -> None:
         self.realized_carry_usd = float(previous.get("realized_total_usd") or 0.0)
         self.high_water_mark = float(previous.get("high_water_mark") or 0.0)
+        # Persist session tracking so same-day restart does not double-count
+        self.session_date = str(previous.get("session_date") or "")
+        self.session_realized_usd = float(previous.get("session_realized_usd") or 0.0)
 
     def snapshot(
         self,
@@ -108,6 +116,17 @@ class SleeveTracker:
         now_ns: int,
     ) -> dict[str, Any]:
         alloc = self.allocated_capital_usd
+        from src.common.timeutil import ny_date
+        today = ny_date(now_ns).isoformat()
+        if today != self.session_date:
+            # New session: previous session's realized carry is the new base
+            self.realized_carry_usd = realized_pnl_usd
+            self.session_date = today
+            self.session_realized_usd = 0.0
+        else:
+            # Same session: the incoming realized_pnl_usd already includes carry
+            pass
+
         equity = alloc + (realized_pnl_usd + unrealized_pnl_usd)
         if self.high_water_mark <= 0.0:
             self.high_water_mark = max(alloc, equity)
@@ -122,4 +141,6 @@ class SleeveTracker:
             "unrealized_pnl_usd": round(unrealized_pnl_usd, 2),
             "open_positions": open_positions,
             "ts_ns": now_ns,
+            "session_date": self.session_date,
+            "session_realized_usd": round(self.session_realized_usd, 2),
         }

@@ -96,18 +96,32 @@ def test_exit_reason(dte, mid_debit, reason):
     assert exit_reason(dte, mid_debit, entry_credit=0.60, profit_target_fraction=0.5, min_exit_dte=14) == reason
 
 
-def test_exit_confirmation_by_spread_or_leg_positions():
+def test_overlapping_strikes_both_return_exit_confirmed():
+    """Trade A (confirmed at spread level) + Trade B (leg-level) sharing a strike both return exit_confirmed."""
+    LEGS_A = [{"instrument_id": P690, "ratio": 1}, {"instrument_id": P685, "ratio": -1}]
+    LEGS_B = [{"instrument_id": P685, "ratio": 1}, {"instrument_id": P680, "ratio": -1}]
+    book = SpreadBook({
+        "SPREAD_A": {"legs": LEGS_A, "open_lots": 4.0, "expiry": "2026-12-18"},
+        "SPREAD_B": {"legs": LEGS_B, "open_lots": 2.0, "expiry": "2026-12-18"},
+    })
+    # SPREAD_A confirmed at spread level; SPREAD_B confirmed at leg level
+    net_qty = {"SPREAD_A": -4.0, P690: -4.0, P685: -2.0, P680: 2.0}.get
+    mismatches = leg_mismatches(book, lambda iid: net_qty(iid, 0.0))
+    # Both should be confirmed (spread A at spread level, B at leg level with A's legs excluded)
+    assert exit_confirmed("SPREAD_A", book.trades["SPREAD_A"], mismatches, lambda iid: net_qty(iid, 0.0))
+    assert exit_confirmed("SPREAD_B", book.trades["SPREAD_B"], mismatches, lambda iid: net_qty(iid, 0.0))
     trade = {"legs": LEGS, "open_lots": 4.0}
-    expected = SpreadBook({"S1": trade}).expected_leg_positions()
+    book = SpreadBook({"S1": trade})
 
     spread_short = {"S1": -4.0}.get
     assert exit_confirmed("S1", trade, set(), lambda iid: spread_short(iid, 0.0))
 
     legs_held = {P690: -4.0, P685: 4.0}
-    assert leg_mismatches(expected, lambda iid: legs_held.get(iid, 0.0)) == set()
+    assert leg_mismatches(book, lambda iid: legs_held.get(iid, 0.0)) == set()
     assert exit_confirmed("S1", trade, set(), lambda iid: legs_held.get(iid, 0.0))
 
-    nothing_held = leg_mismatches(expected, lambda iid: 0.0)
+    nothing_book = SpreadBook({"S1": trade})
+    nothing_held = leg_mismatches(nothing_book, lambda iid: 0.0)
     assert nothing_held == {P690, P685}
     assert not exit_confirmed("S1", trade, nothing_held, lambda iid: 0.0)
 

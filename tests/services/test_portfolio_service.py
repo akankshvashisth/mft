@@ -70,7 +70,10 @@ def test_empty_book_publishes_flat_risk_and_sleeve(make_service, store, fake_val
     assert set(payload["greeks"].values()) == {0.0}
     assert payload["risk"]["stress_grid_usd"] == [[0.0] * 6 for _ in range(7)]
     assert (payload["risk"]["book_var_99_usd"], payload["risk"]["book_es_99_usd"]) == (0.0, 0.0)
-    assert payload["sleeve"] == positions_payload(NOW_NS)
+    assert payload["sleeve"]["session_date"] == "2026-11-24"
+    sleeve_expected = positions_payload(NOW_NS)
+    sleeve_expected["session_date"] = "2026-11-24"
+    assert payload["sleeve"] == sleeve_expected
 
 
 def test_share_position_marks_live_and_stresses_linearly(make_service):
@@ -218,6 +221,25 @@ def test_surfaces_are_keyed_by_symbol(make_service, store):
     store.set_json(keys.surface_key("QQQ.NASDAQ"), surface_payload("QQQ.NASDAQ"))
     store.set_text(keys.surface_key("BAD.ARCA"), "not json")
     assert sorted(make_service().surfaces_by_symbol()) == ["QQQ", "SPY"]
+
+
+def test_realized_pnl_idempotent_after_restore(make_service, store):
+    """Calling evaluate() -> restore() -> evaluate() on the same day reports the same realized P&L."""
+    store.set_json(keys.POSITIONS_LATEST, positions_payload(realized_total_usd=500.0, high_water_mark=101_000.0))
+    service = make_service()
+    service.restore()
+
+    # First evaluate: 500 carry + 0 session = 500
+    p1 = service.evaluate([PositionView(SPY, 0.0, 700.0, realized_pnl=0.0)], 0.0, NOW_NS)
+    assert p1["realized_pnl_usd"] == 500.0
+
+    # Simulate restart: restore the snapshot from the first evaluation
+    sleeve = store.get_json(keys.POSITIONS_LATEST)
+    service.restore()
+
+    # Second evaluate on same day: should still be 500, not 1000
+    p2 = service.evaluate([PositionView(SPY, 0.0, 700.0, realized_pnl=0.0)], 0.0, NOW_NS + 60_000_000_000)
+    assert p2["realized_pnl_usd"] == 500.0, f"Expected 500.0, got {p2['realized_pnl_usd']}"
 
 
 def test_defined_risk_credit_spread_es99_is_bounded(make_service, store, market):

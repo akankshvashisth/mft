@@ -129,8 +129,29 @@ def exit_reason(
     return None
 
 
-def leg_mismatches(expected: Mapping[str, float], net_position_qty: Callable[[str], float]) -> set[str]:
-    """Option legs whose open position differs from what the book implies."""
+def leg_mismatches(book: "SpreadBook", net_position_qty: Callable[[str], float]) -> set[str]:
+    """Option legs whose open position differs from what the book implies.
+
+    First excludes any trade that is already confirmed at the spread level (the broker
+    holds it as a single spread position), then checks the remaining (unconfirmed) trades'
+    leg-level positions.  This prevents overlapping strikes from falsely blocking exits.
+    """
+    # Partition trades into spread-confirmed vs. leg-level-only
+    spread_confirmed: set[str] = set()
+    unconfirmed_trades: dict[str, Trade] = {}
+    for key, trade in book.trades.items():
+        if abs(net_position_qty(key) + float(trade.get("open_lots", 0.0))) < POSITION_TOLERANCE:
+            spread_confirmed.add(key)
+        else:
+            unconfirmed_trades[key] = trade
+
+    # Compute expected leg positions only from unconfirmed trades
+    expected: dict[str, float] = {}
+    for trade in unconfirmed_trades.values():
+        for leg in trade["legs"]:
+            leg_id = str(leg["instrument_id"])
+            expected[leg_id] = expected.get(leg_id, 0.0) - float(trade["open_lots"]) * int(leg["ratio"])
+
     return {
         leg_id
         for leg_id, qty in expected.items()

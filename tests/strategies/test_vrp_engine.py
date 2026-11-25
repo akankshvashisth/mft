@@ -8,7 +8,7 @@ import pytest
 from src.common import keys
 from src.common.market import QuoteObs
 from src.execution.passive_combo import PassiveComboExecutor
-from src.strategies.vrp_engine import VrpEngine, VrpSettings
+from src.strategies.vrp_engine import OrderView, VrpEngine, VrpSettings
 from tests.factories import NOW_NS, ago, portfolio_payload, risk_assessment, rv_payload, surface_leg, surface_payload
 from tests.fakes import FakeGate, FakeMarket, FakeOrderGateway, FakePricer, written
 
@@ -212,7 +212,40 @@ def test_modify_rejection_cancels_the_order(make_rig):
     assert rig.gateway.cancelled == [order_key]
 
 
-# --- Working-order management ----------------------------------------------------------------------
+# --- Crash/restart reconciliation -----------------------------------------------------------------
+
+
+def test_start_cancels_orphaned_open_orders(make_rig):
+    """start() cancels orphaned open orders from the gateway."""
+    rig = make_rig()
+    # Simulate a pre-existing open order from a prior run
+    rig.gateway.views["ORPHAN-O-1"] = OrderView(is_open=True, is_closed=False, status="ACCEPTED")
+    rig.engine.start()
+    assert "ORPHAN-O-1" in rig.gateway.cancelled
+
+
+def test_start_blocks_entry_on_reconciliation_mismatch(make_rig, store):
+    """start() with a persisted trade missing from broker positions blocks new entries."""
+    OPEN_TRADE = {"combo": "SPY 690/685P Bull Put", "legs": LEGS, "expiry": "2026-12-18", "open_lots": 4.0, "entry_credit": 0.6}
+    rig = make_rig(paper=True, book={SPREAD_ID: OPEN_TRADE})
+    # No broker position exists for SPREAD_ID -> trigger mismatch
+    rig.engine.start()
+    assert rig.engine._reconciliation_mismatch is True
+    assert rig.engine.current_entry_block_reason() == "BOOK_RECONCILIATION_MISMATCH"
+
+
+def test_finalize_releases_order_key(make_rig):
+    """finalize() releases the order key from the gateway."""
+    rig = make_rig()
+    spot(rig)
+    payload = rig.engine.on_timer(NOW_NS, NOW_NS, TODAY)
+    order_key = payload["routed_order_ids"][0]
+    # Verify the key is tracked
+    assert order_key in rig.gateway.views
+    # Finalize it
+    rig.engine.finalize(order_key, "FILLED")
+    # The release is a no-op on FakeOrderGateway; check that the working order is gone
+    assert order_key not in rig.engine.working
 
 
 def test_risk_block_cancels_working_entries_with_a_one_second_cache(make_rig):
