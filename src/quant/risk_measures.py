@@ -96,12 +96,15 @@ def portfolio_horizon_var_es(
 
     rng = np.random.default_rng(seed)
 
-    # Group legs by underlying so both legs of a spread share the same spot path
+    # Group legs by underlying so both legs of a spread share the same spot path.
+    # Unlabelled linear legs (underlying == "") each get a unique key so they never collide.
     underlying_keys: list[str] = []
     group_indices: list[list[int]] = []
     seen: dict[str, int] = {}
     for i, leg in enumerate(legs_spec):
         und = str(leg.get("underlying", ""))
+        if not und:
+            und = f"__leg_{i}"  # unique per unlabelled linear leg
         idx = seen.get(und)
         if idx is None:
             idx = len(underlying_keys)
@@ -119,10 +122,8 @@ def portfolio_horizon_var_es(
         for i in indices:
             leg_to_und[i] = und_idx
 
-    # Underlying-level arrays
-    und_spots = np.array(
-        [legs_spec[group_indices[i][0]]["spot"] for i in range(n_und)], dtype=np.float64
-    )
+    # Underlying-level arrays: use the first leg's spot for drift parameters,
+    # but later scale each leg individually from its own spot.
     und_vols = np.array(
         [
             max(
@@ -148,10 +149,10 @@ def portfolio_horizon_var_es(
         + np.sqrt(1.0 - rho[:, np.newaxis] ** 2) * z_idio
     )
 
-    # Spot simulation: GBM drift
+    # Per-underlying return multiplier exp(drift + vol_scale * z_eff)
     drift = (r - 0.5 * und_vols ** 2) * dt_years
     vol_scale = und_vols * np.sqrt(dt_years)
-    und_spot_sim = und_spots[np.newaxis, :] * np.exp(
+    und_ret_mult = np.exp(
         drift[np.newaxis, :] + vol_scale[np.newaxis, :] * z_eff
     )
 
@@ -164,20 +165,23 @@ def portfolio_horizon_var_es(
     )
     und_vol_sim = np.maximum(und_vols[np.newaxis, :] + vol_shock, 0.05)
 
-    # Map underlying shocks to each leg
-    spot_sim = und_spot_sim[:, leg_to_und]
+    # Map underlying volatility shocks to each leg
     vol_sim = und_vol_sim[:, leg_to_und]
 
-    # Vectorised re-pricing
+    # Vectorised re-pricing: scale each leg from its own spot using the
+    # return multiplier of its underlying group
     from src.quant.black_scholes import bsm_prices
 
     pnl = np.zeros(n_scenarios, dtype=np.float64)
     for i, leg in enumerate(legs_spec):
         qty = float(leg["signed_qty"])
         mult = float(leg["multiplier"])
+        leg_spot = float(leg["spot"])
+        ret_mult = und_ret_mult[:, leg_to_und[i]]
+        spot_sim_i = leg_spot * ret_mult
         if not leg.get("is_option", False):
-            # Linear leg
-            pnl += qty * mult * (spot_sim[:, i] - float(leg["spot"]))
+            # Linear leg: P&L from its own starting spot
+            pnl += qty * mult * (spot_sim_i - leg_spot)
         else:
             strike = float(leg["strike"])
             rem_ttm = max(float(leg.get("ttm", dt_years)) - dt_years, 1e-4)
@@ -185,7 +189,7 @@ def portfolio_horizon_var_es(
             q = float(leg.get("q", 0.0))
             theo = float(leg.get("theo_price", 0.0))
             flag = "c" if is_call else "p"
-            new_prices = bsm_prices(spot_sim[:, i], strike, rem_ttm, r, vol_sim[:, i], flag, q)
+            new_prices = bsm_prices(spot_sim_i, strike, rem_ttm, r, vol_sim[:, i], flag, q)
             pnl += qty * mult * (new_prices - theo)
 
     # Compute VaR and ES from the P&L vector (loss = -pnl)

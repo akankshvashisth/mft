@@ -1,25 +1,28 @@
 === GIT STATUS ===
 
 === COMMITS SINCE BASELINE ===
+45a4428 wp-01-03-review-fixes: math, schema, and edge-case fixes from Sprint 1 review
 06a4d09 wp-03: Unified 14-Day Nonlinear Book ES99 & Fail-Closed UNMODELED_SPREAD
 e42bf8c wp-02: Eliminate Phantom Mid-Cap Liquidity (0 or 10 & max(1,...) floor)
 0092976 wp-01: OHLC Hygiene, Finite-Sample Bipower & Fail-Closed RV
 
 === GIT DIFF --STAT ===
- src/quant/realized_vol.py                | 162 ++++++++++++++++++++++++++++---
- src/quant/risk_measures.py               | 108 ++++++++++++++++++++-
- src/risk/gate_rules.py                   |  52 +++++++---
+ src/adapters/extract.py                  |  15 +++-
+ src/quant/realized_vol.py                | 142 +++++++++++++++++++++++++++----
+ src/quant/risk_measures.py               | 142 ++++++++++++++++++++++++++++++-
+ src/risk/gate_rules.py                   |  52 ++++++++---
  src/risk/gate_types.py                   |   6 +-
- src/services/portfolio.py                |  20 +++-
- src/strategies/vrp_core.py               |   9 +-
- src/strategies/vrp_engine.py             |  45 ++++++---
- tests/quant/test_realized_vol.py         |  83 ++++++++++++++++
- tests/quant/test_risk_measures.py        |  41 ++++++++
- tests/risk/test_gate_rules.py            |  58 ++++++++++-
- tests/services/test_portfolio_service.py |  32 +++++-
+ src/services/portfolio.py                |  34 +++++++-
+ src/services/portfolio_marks.py          |   3 +-
+ src/strategies/vrp_core.py               |  15 ++--
+ src/strategies/vrp_engine.py             |  46 +++++++---
+ tests/quant/test_realized_vol.py         | 101 ++++++++++++++++++++++
+ tests/quant/test_risk_measures.py        |  41 +++++++++
+ tests/risk/test_gate_rules.py            |  58 ++++++++++++-
+ tests/services/test_portfolio_service.py |  61 ++++++++++++-
  tests/strategies/test_vrp_core.py        |   4 +-
- tests/strategies/test_vrp_engine.py      |  53 +++++++++-
- 13 files changed, 614 insertions(+), 59 deletions(-)
+ tests/strategies/test_vrp_engine.py      |  53 +++++++++++-
+ 15 files changed, 711 insertions(+), 62 deletions(-)
 
 === PYTEST OUTPUT (exit=0) ===
 ============================= test session starts ==============================
@@ -29,7 +32,7 @@ rootdir: /home/knight/trading_system
 configfile: pytest.ini
 testpaths: tests
 plugins: anyio-4.16.0, platformdirs-4.14.8
-collecting ... collected 664 items
+collecting ... collected 668 items
 
 tests/actors/test_futures_shell.py::test_start_subscribes_cached_instruments_and_index_bars PASSED [  0%]
 tests/actors/test_futures_shell.py::test_missing_index_feed_is_a_warning PASSED [  0%]
@@ -50,7 +53,7 @@ tests/actors/test_vol_shell.py::test_quotes_to_published_surface PASSED  [  2%]
 tests/actors/test_vol_shell.py::test_stale_spot_publishes_nothing PASSED [  2%]
 tests/adapters/test_extract.py::test_plain_value_conversions PASSED      [  2%]
 tests/adapters/test_extract.py::test_plain_settings_copies_matching_attributes PASSED [  2%]
-tests/adapters/test_extract.py::test_plain_settings_requires_mandatory_fields PASSED [  3%]
+tests/adapters/test_extract.py::test_plain_settings_requires_mandatory_fields PASSED [  2%]
 tests/adapters/test_extract.py::test_option_spec_from_instrument PASSED  [  3%]
 tests/adapters/test_extract.py::test_unknown_open_interest_stays_unknown[None-None] PASSED [  3%]
 tests/adapters/test_extract.py::test_unknown_open_interest_stays_unknown[info1-None] PASSED [  3%]
@@ -70,7 +73,7 @@ tests/adapters/test_nautilus_conversions.py::test_bar_conversion_detects_daily_b
 tests/adapters/test_nautilus_conversions.py::test_bar_conversion_detects_daily_bars[SPY.ARCA-1-MINUTE-LAST-EXTERNAL-MINUTE] PASSED [  5%]
 tests/adapters/test_nautilus_conversions.py::test_bar_types_and_ids PASSED [  5%]
 tests/adapters/test_nautilus_conversions.py::test_anything_but_option_contracts_and_spreads_is_other PASSED [  5%]
-tests/adapters/test_order_gateway.py::test_prepare_builds_one_spread_instrument_and_day_limit_orders PASSED [  6%]
+tests/adapters/test_order_gateway.py::test_prepare_builds_one_spread_instrument_and_day_limit_orders PASSED [  5%]
 tests/adapters/test_order_gateway.py::test_order_views_modifications_and_cancels PASSED [  6%]
 tests/adapters/test_order_gateway.py::test_modify_needs_the_spread_instrument PASSED [  6%]
 tests/adapters/test_order_gateway.py::test_market_view PASSED            [  6%]
@@ -90,7 +93,7 @@ tests/common/test_freshness.py::test_timestamp_uses_the_first_valid_field_in_pri
 tests/common/test_freshness.py::test_timestamp_ignores_values_that_are_not_epoch_nanoseconds PASSED [  8%]
 tests/common/test_freshness.py::test_age_is_measured_in_seconds PASSED   [  8%]
 tests/common/test_freshness.py::test_small_future_skew_reads_as_zero_age_but_far_future_is_unusable PASSED [  8%]
-tests/common/test_freshness.py::test_missing_timestamp_has_no_age PASSED [  9%]
+tests/common/test_freshness.py::test_missing_timestamp_has_no_age PASSED [  8%]
 tests/common/test_freshness.py::test_is_fresh_includes_the_age_limit PASSED [  9%]
 tests/common/test_keys.py::test_key_builders_match_the_published_key_names PASSED [  9%]
 tests/common/test_keys.py::test_fixed_key_names_are_stable PASSED        [  9%]
@@ -110,7 +113,7 @@ tests/common/test_misc.py::test_latest_value_keeps_the_newest_observation PASSED
 tests/common/test_misc.py::test_latest_value_strictly_newer_rejects_equal_timestamps PASSED [ 11%]
 tests/common/test_misc.py::test_latest_value_fresh PASSED                [ 11%]
 tests/common/test_misc.py::test_quote_mid_and_bar_helpers PASSED         [ 11%]
-tests/common/test_misc.py::test_symbol_of PASSED                         [ 12%]
+tests/common/test_misc.py::test_symbol_of PASSED                         [ 11%]
 tests/common/test_misc.py::test_numeric_helpers PASSED                   [ 12%]
 tests/common/test_misc.py::test_finite_or_none PASSED                    [ 12%]
 tests/common/test_quotes.py::test_two_sided_mid[1.0-1.2-1.1] PASSED      [ 12%]
@@ -123,14 +126,14 @@ tests/common/test_quotes.py::test_tradable_quote_needs_a_positive_spread[1.0-1.2
 tests/common/test_quotes.py::test_tradable_quote_needs_a_positive_spread[1.0-1.0-False] PASSED [ 13%]
 tests/common/test_quotes.py::test_tradable_quote_needs_a_positive_spread[0.0-1.0-False] PASSED [ 13%]
 tests/common/test_quotes.py::test_tradable_quote_needs_a_positive_spread[1.2-1.0-False] PASSED [ 13%]
-tests/common/test_quotes.py::test_selling_a_credit_spread_hits_the_sold_leg_bid_and_lifts_the_wing_offer PASSED [ 14%]
+tests/common/test_quotes.py::test_selling_a_credit_spread_hits_the_sold_leg_bid_and_lifts_the_wing_offer PASSED [ 13%]
 tests/common/test_quotes.py::test_buying_back_pays_the_sold_leg_offer_and_sells_the_wing_bid PASSED [ 14%]
 tests/common/test_quotes.py::test_missing_leg_quote_gives_no_price PASSED [ 14%]
 tests/common/test_store.py::test_safe_json_loads_handles_bytes_text_and_garbage PASSED [ 14%]
 tests/common/test_store.py::test_safe_json_dict_only_accepts_objects PASSED [ 14%]
 tests/common/test_store.py::test_reads_return_empty_values_for_missing_or_invalid_keys PASSED [ 14%]
 tests/common/test_store.py::test_set_json_sets_a_ttl_only_when_given PASSED [ 14%]
-tests/common/test_store.py::test_push_capped_keeps_newest_first_and_trims PASSED [ 15%]
+tests/common/test_store.py::test_push_capped_keeps_newest_first_and_trims PASSED [ 14%]
 tests/common/test_store.py::test_push_capped_stores_text_unchanged PASSED [ 15%]
 tests/common/test_store.py::test_get_json_list_skips_invalid_entries_and_respects_count PASSED [ 15%]
 tests/common/test_store.py::test_list_keys_uses_scan_and_sorts PASSED    [ 15%]
@@ -143,14 +146,14 @@ tests/common/test_timeutil.py::test_ny_date_differs_from_utc_date_late_in_the_ne
 tests/common/test_timeutil.py::test_ny_date_follows_daylight_saving_time PASSED [ 16%]
 tests/common/test_timeutil.py::test_is_regular_session[1795530599000000000-False] PASSED [ 16%]
 tests/common/test_timeutil.py::test_is_regular_session[1795530600000000000-True] PASSED [ 16%]
-tests/common/test_timeutil.py::test_is_regular_session[1795554000000000000-True] PASSED [ 17%]
+tests/common/test_timeutil.py::test_is_regular_session[1795554000000000000-True] PASSED [ 16%]
 tests/common/test_timeutil.py::test_is_regular_session[1795554001000000000-False] PASSED [ 17%]
 tests/common/test_timeutil.py::test_is_regular_session[1795878000000000000-False] PASSED [ 17%]
 tests/common/test_timeutil.py::test_is_regular_session[1795705200000000000-False] PASSED [ 17%]
 tests/common/test_timeutil.py::test_is_regular_session[1782912599000000000-False] PASSED [ 17%]
 tests/common/test_timeutil.py::test_is_regular_session[1782912600000000000-True] PASSED [ 17%]
 tests/common/test_timeutil.py::test_nyse_trading_days[day0-True] PASSED  [ 17%]
-tests/common/test_timeutil.py::test_nyse_trading_days[day1-False] PASSED [ 18%]
+tests/common/test_timeutil.py::test_nyse_trading_days[day1-False] PASSED [ 17%]
 tests/common/test_timeutil.py::test_nyse_trading_days[day2-False] PASSED [ 18%]
 tests/common/test_timeutil.py::test_nyse_trading_days[day3-False] PASSED [ 18%]
 tests/common/test_timeutil.py::test_years_until_uses_365_25_day_years_and_a_floor PASSED [ 18%]
@@ -163,14 +166,14 @@ tests/dashboard/test_formatting.py::test_fmt[None-.2f-N/A] PASSED        [ 19%]
 tests/dashboard/test_formatting.py::test_fmt[True-.2f-N/A] PASSED        [ 19%]
 tests/dashboard/test_formatting.py::test_fmt[7-.2f-N/A] PASSED           [ 19%]
 tests/dashboard/test_formatting.py::test_fmt_custom_placeholder PASSED   [ 19%]
-tests/dashboard/test_formatting.py::test_pct_or_none PASSED              [ 20%]
+tests/dashboard/test_formatting.py::test_pct_or_none PASSED              [ 19%]
 tests/dashboard/test_state.py::test_surface_keys_use_scan_not_keys PASSED [ 20%]
 tests/dashboard/test_state.py::test_live_state_reads_every_snapshot PASSED [ 20%]
 tests/dashboard/test_state.py::test_live_state_of_an_empty_store PASSED  [ 20%]
 tests/dashboard/test_state.py::test_age_seconds[payload0-30.0] PASSED    [ 20%]
 tests/dashboard/test_state.py::test_age_seconds[payload1-12.0] PASSED    [ 20%]
 tests/dashboard/test_state.py::test_age_seconds[payload2-5.0] PASSED     [ 20%]
-tests/dashboard/test_state.py::test_age_seconds[payload3-0.0] PASSED     [ 21%]
+tests/dashboard/test_state.py::test_age_seconds[payload3-0.0] PASSED     [ 20%]
 tests/dashboard/test_state.py::test_age_seconds[payload4-None] PASSED    [ 21%]
 tests/dashboard/test_state.py::test_age_seconds[payload5-None] PASSED    [ 21%]
 tests/dashboard/test_state.py::test_age_seconds[payload6-None] PASSED    [ 21%]
@@ -183,120 +186,121 @@ tests/dashboard/test_state.py::test_manual_halt_flag[None-False] PASSED  [ 22%]
 tests/dashboard/test_state.py::test_manual_halt_engage_and_release PASSED [ 22%]
 tests/dashboard/test_views.py::test_banner_levels PASSED                 [ 22%]
 tests/dashboard/test_views.py::test_banner_before_metrics_and_surface_exist PASSED [ 22%]
-tests/dashboard/test_views.py::test_vrp_spread_sources PASSED            [ 23%]
+tests/dashboard/test_views.py::test_vrp_spread_sources PASSED            [ 22%]
 tests/dashboard/test_views.py::test_actor_rows_wait_for_missing_payloads PASSED [ 23%]
 tests/dashboard/test_views.py::test_actor_rows_format_live_payloads PASSED [ 23%]
 tests/dashboard/test_views.py::test_universe_snapshot_sorted_by_percentile PASSED [ 23%]
 tests/dashboard/test_views.py::test_universe_rv_rows_in_percent PASSED   [ 23%]
 tests/dashboard/test_views.py::test_svi_parameter_rows PASSED            [ 23%]
 tests/dashboard/test_views.py::test_decision_matrix_matches_the_classifier PASSED [ 23%]
-tests/dashboard/test_views.py::test_attribution_rows PASSED              [ 24%]
+tests/dashboard/test_views.py::test_attribution_rows PASSED              [ 23%]
 tests/dashboard/test_views.py::test_forward_comparison_rows_handle_missing_futures_values PASSED [ 24%]
 tests/dashboard/test_views.py::test_risk_transition_rows PASSED          [ 24%]
 tests/dashboard/test_views.py::test_dense_smile_spans_the_quoted_moneyness PASSED [ 24%]
 tests/dashboard/test_views.py::test_smile_density_is_normalised PASSED   [ 24%]
 tests/dashboard/test_views.py::test_smile_density_of_inadmissible_svi_parameters_is_unavailable PASSED [ 24%]
-tests/data/test_event_calendar.py::test_earnings_inside_the_holding_window_block_entry PASSED [ 25%]
+tests/data/test_event_calendar.py::test_earnings_inside_the_holding_window_block_entry PASSED [ 24%]
 tests/data/test_event_calendar.py::test_earnings_window_is_inclusive[as_of0-expiry0-False] PASSED [ 25%]
 tests/data/test_event_calendar.py::test_earnings_window_is_inclusive[as_of1-expiry1-False] PASSED [ 25%]
 tests/data/test_event_calendar.py::test_earnings_window_is_inclusive[as_of2-expiry2-True] PASSED [ 25%]
 tests/data/test_event_calendar.py::test_earnings_window_is_inclusive[as_of3-expiry3-True] PASSED [ 25%]
 tests/data/test_event_calendar.py::test_in_the_money_short_call_with_thin_extrinsic_blocks_over_ex_dividend PASSED [ 25%]
 tests/data/test_event_calendar.py::test_ex_dividend_passes_without_plausible_early_assignment[kwargs0] PASSED [ 25%]
-tests/data/test_event_calendar.py::test_ex_dividend_passes_without_plausible_early_assignment[kwargs1] PASSED [ 26%]
+tests/data/test_event_calendar.py::test_ex_dividend_passes_without_plausible_early_assignment[kwargs1] PASSED [ 25%]
 tests/data/test_event_calendar.py::test_ex_dividend_passes_without_plausible_early_assignment[kwargs2] PASSED [ 26%]
 tests/data/test_event_calendar.py::test_ex_dividend_after_expiry_is_ignored PASSED [ 26%]
 tests/data/test_event_calendar.py::test_early_assignment_rule[690.0-700.0-0.5-True] PASSED [ 26%]
 tests/data/test_event_calendar.py::test_early_assignment_rule[None-700.0-0.5-True] PASSED [ 26%]
 tests/data/test_event_calendar.py::test_early_assignment_rule[690.0-None-0.5-True] PASSED [ 26%]
 tests/data/test_event_calendar.py::test_early_assignment_rule[690.0-700.0-None-True] PASSED [ 26%]
-tests/data/test_event_calendar.py::test_early_assignment_rule[700.0-700.0-0.5-False] PASSED [ 27%]
+tests/data/test_event_calendar.py::test_early_assignment_rule[700.0-700.0-0.5-False] PASSED [ 26%]
 tests/data/test_event_calendar.py::test_early_assignment_rule[690.0-700.0-1.78-False] PASSED [ 27%]
 tests/data/test_event_calendar.py::test_macro_release_window[as_of0-2026-12-04 US Non-Farm Payrolls] PASSED [ 27%]
 tests/data/test_event_calendar.py::test_macro_release_window[as_of1-2026-12-04 US Non-Farm Payrolls] PASSED [ 27%]
 tests/data/test_event_calendar.py::test_macro_release_window[as_of2-2026-12-09 FOMC Rate Decision] PASSED [ 27%]
 tests/data/test_event_calendar.py::test_macro_release_window[as_of3-None] PASSED [ 27%]
-tests/data/test_event_calendar.py::test_macro_release_window[as_of4-None] PASSED [ 28%]
-tests/data/test_event_calendar.py::test_symbols_match_exactly_then_by_root PASSED [ 28%]
+tests/data/test_event_calendar.py::test_macro_release_window[as_of4-None] PASSED [ 27%]
+tests/data/test_event_calendar.py::test_symbols_match_exactly_then_by_root PASSED [ 27%]
 tests/data/test_event_calendar.py::test_unknown_symbol_has_no_corporate_events PASSED [ 28%]
 tests/data/test_event_calendar.py::test_macro_window_is_configurable PASSED [ 28%]
 tests/data/test_event_calendar.py::test_repository_events_file_loads PASSED [ 28%]
 tests/data/test_event_calendar.py::test_yaml_native_dates_are_accepted PASSED [ 28%]
 tests/data/test_event_calendar.py::test_default_gate_calendar_is_the_file_backed_calendar PASSED [ 28%]
-tests/execution/test_passive_combo.py::test_limits_step_toward_natural_until_the_cap[CREDIT_OPEN-1.0-0.8-limits0] PASSED [ 29%]
+tests/execution/test_passive_combo.py::test_limits_step_toward_natural_until_the_cap[CREDIT_OPEN-1.0-0.8-limits0] PASSED [ 28%]
 tests/execution/test_passive_combo.py::test_limits_step_toward_natural_until_the_cap[DEBIT_CLOSE-1.0-1.2-limits1] PASSED [ 29%]
 tests/execution/test_passive_combo.py::test_limit_never_crosses_natural PASSED [ 29%]
 tests/execution/test_passive_combo.py::test_parent_order_is_sliced_into_registered_clips PASSED [ 29%]
 tests/execution/test_passive_combo.py::test_previews_and_empty_plans_track_nothing PASSED [ 29%]
 tests/execution/test_passive_combo.py::test_adverse_spot_move_cancels PASSED [ 29%]
 tests/execution/test_passive_combo.py::test_dwell_steps_then_final_cancel_at_the_cap PASSED [ 29%]
-tests/execution/test_passive_combo.py::test_default_clock_drives_dwell PASSED [ 30%]
+tests/execution/test_passive_combo.py::test_default_clock_drives_dwell PASSED [ 29%]
 tests/execution/test_passive_combo.py::test_ticks_only_touch_the_matching_parent_and_underlying PASSED [ 30%]
 tests/execution/test_passive_combo.py::test_status_helpers PASSED        [ 30%]
 tests/execution/test_passive_combo.py::test_fill_records_slippage_against_the_modeled_mid PASSED [ 30%]
 tests/execution/test_passive_combo.py::test_partial_fills_and_closing_debits PASSED [ 30%]
 tests/execution/test_passive_combo.py::test_unknown_clip_fill_is_still_recorded PASSED [ 30%]
-tests/execution/test_passive_combo.py::test_default_sink_writes_lazily PASSED [ 31%]
-tests/execution/test_passive_combo.py::test_default_parent_ids_are_random_hex PASSED [ 31%]
+tests/execution/test_passive_combo.py::test_default_sink_writes_lazily PASSED [ 30%]
+tests/execution/test_passive_combo.py::test_default_parent_ids_are_random_hex PASSED [ 30%]
 tests/quant/test_black_scholes.py::test_price_and_first_order_greeks_match_the_analytic_engine[True] PASSED [ 31%]
 tests/quant/test_black_scholes.py::test_price_and_first_order_greeks_match_the_analytic_engine[False] PASSED [ 31%]
 tests/quant/test_black_scholes.py::test_vanna_and_charm_are_numerical_derivatives_of_delta[True] PASSED [ 31%]
 tests/quant/test_black_scholes.py::test_vanna_and_charm_are_numerical_derivatives_of_delta[False] PASSED [ 31%]
 tests/quant/test_black_scholes.py::test_put_call_parity_for_price_delta_and_shared_greeks PASSED [ 31%]
-tests/quant/test_black_scholes.py::test_expired_or_zero_vol_options_are_worth_intrinsic[700.0-690.0-0.0-0.2-True-10.0-1.0] PASSED [ 32%]
+tests/quant/test_black_scholes.py::test_expired_or_zero_vol_options_are_worth_intrinsic[700.0-690.0-0.0-0.2-True-10.0-1.0] PASSED [ 31%]
 tests/quant/test_black_scholes.py::test_expired_or_zero_vol_options_are_worth_intrinsic[700.0-690.0-0.0-0.2-False-0.0-0.0] PASSED [ 32%]
 tests/quant/test_black_scholes.py::test_expired_or_zero_vol_options_are_worth_intrinsic[680.0-690.0-0.0-0.2-False-10.0--1.0] PASSED [ 32%]
 tests/quant/test_black_scholes.py::test_expired_or_zero_vol_options_are_worth_intrinsic[680.0-690.0-0.5-0.0-True-0.0-0.0] PASSED [ 32%]
 tests/quant/test_black_scholes.py::test_expired_or_zero_vol_options_are_worth_intrinsic[0.0-690.0-0.5-0.2-True-0.0-0.0] PASSED [ 32%]
 tests/quant/test_black_scholes.py::test_expired_or_zero_vol_options_are_worth_intrinsic[0.0-690.0-0.5-0.2-False-690.0--1.0] PASSED [ 32%]
 tests/quant/test_black_scholes.py::test_expired_or_zero_vol_options_are_worth_intrinsic[700.0-0.0-0.5-0.2-True-700.0-1.0] PASSED [ 32%]
-tests/quant/test_black_scholes.py::test_intrinsic_and_extrinsic_value PASSED [ 33%]
+tests/quant/test_black_scholes.py::test_intrinsic_and_extrinsic_value PASSED [ 32%]
 tests/quant/test_black_scholes.py::test_vectorised_prices_match_the_analytic_engine PASSED [ 33%]
 tests/quant/test_black_scholes.py::test_vectorised_prices_default_to_no_dividend PASSED [ 33%]
 tests/quant/test_black_scholes.py::test_implied_vols_invert_engine_prices PASSED [ 33%]
 tests/quant/test_black_scholes.py::test_prices_outside_the_no_arbitrage_bounds_have_no_implied_vol PASSED [ 33%]
 tests/quant/test_black_scholes.py::test_black_vega_on_the_carry_forward_is_the_engine_vega PASSED [ 33%]
-tests/quant/test_density.py::test_flat_smile_density_is_the_black_lognormal PASSED [ 34%]
-tests/quant/test_density.py::test_density_is_non_negative_and_normalised_on_the_default_grid PASSED [ 34%]
+tests/quant/test_density.py::test_flat_smile_density_is_the_black_lognormal PASSED [ 33%]
+tests/quant/test_density.py::test_density_is_non_negative_and_normalised_on_the_default_grid PASSED [ 33%]
 tests/quant/test_density.py::test_inadmissible_svi_parameters_are_rejected PASSED [ 34%]
 tests/quant/test_parity.py::test_parity_consistent_quotes_round_trip_forward_and_dividend_yield PASSED [ 34%]
 tests/quant/test_parity.py::test_median_ignores_a_single_mispriced_pair PASSED [ 34%]
 tests/quant/test_parity.py::test_implausible_dividend_yield_falls_back_to_prior PASSED [ 34%]
 tests/quant/test_parity.py::test_calls_without_matching_puts_fall_back_to_prior PASSED [ 34%]
-tests/quant/test_parity.py::test_filtered_quotes_do_not_count_as_pairs[pair_kwargs0-strikes0] PASSED [ 35%]
+tests/quant/test_parity.py::test_filtered_quotes_do_not_count_as_pairs[pair_kwargs0-strikes0] PASSED [ 34%]
 tests/quant/test_parity.py::test_filtered_quotes_do_not_count_as_pairs[pair_kwargs1-strikes1] PASSED [ 35%]
 tests/quant/test_parity.py::test_filtered_quotes_do_not_count_as_pairs[pair_kwargs2-strikes2] PASSED [ 35%]
 tests/quant/test_quote_hygiene.py::test_otm_quotes_are_kept_with_their_spreads PASSED [ 35%]
 tests/quant/test_quote_hygiene.py::test_each_drop_reason_is_counted[quote0-stale] PASSED [ 35%]
 tests/quant/test_quote_hygiene.py::test_each_drop_reason_is_counted[quote1-spread] PASSED [ 35%]
 tests/quant/test_quote_hygiene.py::test_each_drop_reason_is_counted[quote2-spread] PASSED [ 35%]
-tests/quant/test_quote_hygiene.py::test_each_drop_reason_is_counted[quote3-itm] PASSED [ 36%]
+tests/quant/test_quote_hygiene.py::test_each_drop_reason_is_counted[quote3-itm] PASSED [ 35%]
 tests/quant/test_quote_hygiene.py::test_each_drop_reason_is_counted[quote4-itm] PASSED [ 36%]
 tests/quant/test_quote_hygiene.py::test_each_drop_reason_is_counted[quote5-intrinsic] PASSED [ 36%]
 tests/quant/test_quote_hygiene.py::test_drop_counter_keys_are_stable PASSED [ 36%]
 tests/quant/test_quote_hygiene.py::test_open_interest_gate_applies_only_to_known_open_interest PASSED [ 36%]
 tests/quant/test_quote_hygiene.py::test_locked_quotes_get_a_minimum_spread PASSED [ 36%]
-tests/quant/test_quote_hygiene.py::test_staleness_check_can_be_disabled PASSED [ 37%]
-tests/quant/test_quote_hygiene.py::test_mask_keeps_sane_quotes_and_rejects_bad_ones PASSED [ 37%]
+tests/quant/test_quote_hygiene.py::test_staleness_check_can_be_disabled PASSED [ 36%]
+tests/quant/test_quote_hygiene.py::test_mask_keeps_sane_quotes_and_rejects_bad_ones PASSED [ 36%]
 tests/quant/test_quote_hygiene.py::test_mask_rejects_zero_bids_and_wide_spreads_when_quotes_are_given PASSED [ 37%]
 tests/quant/test_realized_vol.py::test_constant_prices_hit_the_variance_floor PASSED [ 37%]
 tests/quant/test_realized_vol.py::test_rv_is_invariant_to_price_scale PASSED [ 37%]
 tests/quant/test_realized_vol.py::test_rv_tracks_the_simulated_volatility PASSED [ 37%]
 tests/quant/test_realized_vol.py::test_short_history_falls_back_to_close_to_close_vol PASSED [ 37%]
-tests/quant/test_realized_vol.py::test_realized_vol_guards_invalid_ohlc_and_windows PASSED [ 38%]
+tests/quant/test_realized_vol.py::test_realized_vol_guards_invalid_ohlc_and_windows PASSED [ 37%]
 tests/quant/test_realized_vol.py::test_sanitize_ohlc_removes_corrupt_bars PASSED [ 38%]
 tests/quant/test_realized_vol.py::test_sanitize_ohlc_quarantines_bad_ohlc PASSED [ 38%]
+tests/quant/test_realized_vol.py::test_trailing_rolling_rv_with_datetimeindex PASSED [ 38%]
 tests/quant/test_realized_vol.py::test_bipower_finite_sample_correction PASSED [ 38%]
 tests/quant/test_realized_vol.py::test_trailing_rolling_rv_vectorized_matches_scalar PASSED [ 38%]
 tests/quant/test_realized_vol.py::test_jump_ratio_is_zero_without_movement_or_history PASSED [ 38%]
-tests/quant/test_realized_vol.py::test_single_isolated_jump_is_all_jump_variance PASSED [ 39%]
+tests/quant/test_realized_vol.py::test_single_isolated_jump_is_all_jump_variance PASSED [ 38%]
 tests/quant/test_realized_vol.py::test_steady_diffusion_is_clipped_to_zero_jump_share PASSED [ 39%]
 tests/quant/test_realized_vol.py::test_daily_returns_use_new_york_dates_and_last_close_per_date PASSED [ 39%]
 tests/quant/test_realized_vol.py::test_average_pairwise_correlation_of_linked_series PASSED [ 39%]
 tests/quant/test_realized_vol.py::test_correlation_aligns_on_dates_not_positions PASSED [ 39%]
 tests/quant/test_realized_vol.py::test_correlation_needs_two_series_and_enough_overlap PASSED [ 39%]
 tests/quant/test_realized_vol.py::test_percentile_rank_options PASSED    [ 39%]
-tests/quant/test_realized_vol.py::test_trailing_rolling_rv_windows PASSED [ 40%]
+tests/quant/test_realized_vol.py::test_trailing_rolling_rv_windows PASSED [ 39%]
 tests/quant/test_risk_measures.py::test_tail_metrics_on_a_uniform_ladder PASSED [ 40%]
 tests/quant/test_risk_measures.py::test_tail_metrics_ignore_non_finite_observations PASSED [ 40%]
 tests/quant/test_risk_measures.py::test_tail_metrics_are_zero_for_empty_or_non_finite_input PASSED [ 40%]
@@ -309,14 +313,14 @@ tests/quant/test_risk_measures.py::test_tail_loss_per_lot_handles_non_finite_es[
 tests/quant/test_risk_measures.py::test_tail_loss_per_lot_handles_non_finite_es[-inf] PASSED [ 41%]
 tests/quant/test_risk_measures.py::test_contracts_for_tail_budget[10.0--300.0-1000.0-3] PASSED [ 41%]
 tests/quant/test_risk_measures.py::test_contracts_for_tail_budget[10.0--0.5-1000.0-1000] PASSED [ 41%]
-tests/quant/test_risk_measures.py::test_contracts_for_tail_budget[0.0--300.0-1000.0-0] PASSED [ 42%]
+tests/quant/test_risk_measures.py::test_contracts_for_tail_budget[0.0--300.0-1000.0-0] PASSED [ 41%]
 tests/quant/test_risk_measures.py::test_contracts_for_tail_budget[-5.0--300.0-1000.0-0] PASSED [ 42%]
 tests/quant/test_risk_measures.py::test_parametric_var_es_are_normal_multiples_of_the_linear_pnl_std[100.0-0.0-500.0] PASSED [ 42%]
 tests/quant/test_risk_measures.py::test_parametric_var_es_are_normal_multiples_of_the_linear_pnl_std[-100.0--10.0-500.8] PASSED [ 42%]
 tests/quant/test_risk_measures.py::test_parametric_var_es_properties PASSED [ 42%]
 tests/quant/test_risk_measures.py::test_parametric_var_es_rejects_invalid_numeric_inputs[kwargs0] PASSED [ 42%]
 tests/quant/test_risk_measures.py::test_parametric_var_es_rejects_invalid_numeric_inputs[kwargs1] PASSED [ 42%]
-tests/quant/test_risk_measures.py::test_parametric_var_es_rejects_invalid_numeric_inputs[kwargs2] PASSED [ 43%]
+tests/quant/test_risk_measures.py::test_parametric_var_es_rejects_invalid_numeric_inputs[kwargs2] PASSED [ 42%]
 tests/quant/test_risk_measures.py::test_parametric_var_es_rejects_invalid_numeric_inputs[kwargs3] PASSED [ 43%]
 tests/quant/test_risk_measures.py::test_parametric_var_es_rejects_invalid_numeric_inputs[kwargs4] PASSED [ 43%]
 tests/quant/test_risk_measures.py::test_parametric_var_es_rejects_invalid_numeric_inputs[kwargs5] PASSED [ 43%]
@@ -329,14 +333,14 @@ tests/quant/test_stress.py::test_pnl_function_is_called_once_with_flat_vectors P
 tests/quant/test_stress.py::test_grid_values_are_rounded_plain_floats PASSED [ 44%]
 tests/quant/test_surface_metrics.py::test_delta25_log_moneyness_and_its_vol_floor PASSED [ 44%]
 tests/quant/test_surface_metrics.py::test_symmetric_smile_has_no_risk_reversal_and_positive_butterfly PASSED [ 44%]
-tests/quant/test_surface_metrics.py::test_svi_wings_are_the_smile_at_plus_and_minus_k25 PASSED [ 45%]
+tests/quant/test_surface_metrics.py::test_svi_wings_are_the_smile_at_plus_and_minus_k25 PASSED [ 44%]
 tests/quant/test_surface_metrics.py::test_wings_fall_back_to_atm_and_skew_without_params PASSED [ 45%]
 tests/quant/test_surface_metrics.py::test_strategy_bias_decision_table[1.0-0.05-0.01-50.0-DEFENSIVE_OR_LONG_CONVEXITY] PASSED [ 45%]
 tests/quant/test_surface_metrics.py::test_strategy_bias_decision_table[0.9--0.02-0.01-50.0-DEFENSIVE_OR_LONG_CONVEXITY] PASSED [ 45%]
 tests/quant/test_surface_metrics.py::test_strategy_bias_decision_table[0.9--0.015-0.01-50.0-SELECTIVE_RELATIVE_VALUE_SPREADS] PASSED [ 45%]
 tests/quant/test_surface_metrics.py::test_strategy_bias_decision_table[0.9-0.02-0.005-10.0-SHORT_VRP_IRON_CONDOR_OR_CREDIT_SPREAD] PASSED [ 45%]
 tests/quant/test_surface_metrics.py::test_strategy_bias_decision_table[0.9-0.019-0.01-20.0-BULLISH_RISK_REVERSAL_OR_PUT_SPREAD] PASSED [ 45%]
-tests/quant/test_surface_metrics.py::test_strategy_bias_decision_table[0.9-0.03-0.004-21.0-SELECTIVE_RELATIVE_VALUE_SPREADS] PASSED [ 46%]
+tests/quant/test_surface_metrics.py::test_strategy_bias_decision_table[0.9-0.03-0.004-21.0-SELECTIVE_RELATIVE_VALUE_SPREADS] PASSED [ 45%]
 tests/quant/test_surface_metrics.py::test_trend_states[110.0-105.0-100.0-UPTREND] PASSED [ 46%]
 tests/quant/test_surface_metrics.py::test_trend_states[90.0-95.0-100.0-DOWNTREND] PASSED [ 46%]
 tests/quant/test_surface_metrics.py::test_trend_states[100.0-100.0-100.0-RANGE_OR_TRANSITION] PASSED [ 46%]
@@ -349,241 +353,244 @@ tests/quant/test_svi.py::test_smile_section_rejects_inadmissible_parameters[para
 tests/quant/test_svi.py::test_smile_section_rejects_inadmissible_parameters[params1] PASSED [ 47%]
 tests/quant/test_svi.py::test_smile_section_rejects_inadmissible_parameters[params2] PASSED [ 47%]
 tests/quant/test_svi.py::test_floor_versus_none_policies_for_negative_variance PASSED [ 47%]
-tests/quant/test_svi.py::test_scalar_helper_agrees_with_vectorised_helper PASSED [ 48%]
+tests/quant/test_svi.py::test_scalar_helper_agrees_with_vectorised_helper PASSED [ 47%]
 tests/quant/test_svi.py::test_scalar_helper_rejects_malformed_inputs[None-0.08213552361396304] PASSED [ 48%]
 tests/quant/test_svi.py::test_scalar_helper_rejects_malformed_inputs[params1-0.08213552361396304] PASSED [ 48%]
 tests/quant/test_svi.py::test_scalar_helper_rejects_malformed_inputs[params2-0.0] PASSED [ 48%]
 tests/quant/test_svi.py::test_scalar_helper_rejects_malformed_inputs[params3-1e-07] PASSED [ 48%]
 tests/quant/test_svi.py::test_vectorised_helper_floors_maturity PASSED   [ 48%]
 tests/quant/test_svi.py::test_roger_lee_utilization PASSED               [ 48%]
-tests/quant/test_svi.py::test_cold_start_uses_the_documented_initial_guess PASSED [ 49%]
+tests/quant/test_svi.py::test_cold_start_uses_the_documented_initial_guess PASSED [ 48%]
 tests/quant/test_svi.py::test_good_warm_start_is_kept_without_a_cold_refit PASSED [ 49%]
 tests/quant/test_svi.py::test_poor_warm_fit_falls_back_to_cold_start PASSED [ 49%]
 tests/quant/test_svi.py::test_cold_refit_is_discarded_when_it_is_worse PASSED [ 49%]
 tests/quant/test_svi.py::test_warm_start_is_clipped_inside_the_bounds PASSED [ 49%]
 tests/quant/test_svi.py::test_fit_recovers_a_synthetic_smile_from_a_cold_start PASSED [ 49%]
-tests/risk/test_daemon_rules.py::test_healthy_inputs_do_not_halt PASSED  [ 50%]
+tests/risk/test_daemon_rules.py::test_healthy_inputs_do_not_halt PASSED  [ 49%]
 tests/risk/test_daemon_rules.py::test_each_failed_check_halts_with_its_reason[overrides0-manual_kill_switch_active-manual_kill_switch_active] PASSED [ 50%]
 tests/risk/test_daemon_rules.py::test_each_failed_check_halts_with_its_reason[overrides1-manual_kill_switch_active-manual_kill_switch_active] PASSED [ 50%]
 tests/risk/test_daemon_rules.py::test_each_failed_check_halts_with_its_reason[overrides2-missing_regime_signal-missing_regime_signal] PASSED [ 50%]
 tests/risk/test_daemon_rules.py::test_each_failed_check_halts_with_its_reason[overrides3-stale_regime_signal-stale_regime_signal:121.0s] PASSED [ 50%]
 tests/risk/test_daemon_rules.py::test_each_failed_check_halts_with_its_reason[overrides4-stale_regime_feed-stale_regime_feed:95.5s] PASSED [ 50%]
 tests/risk/test_daemon_rules.py::test_each_failed_check_halts_with_its_reason[overrides5-vix_backwardation-vix_backwardation:1.0500>1.0] PASSED [ 50%]
-tests/risk/test_daemon_rules.py::test_each_failed_check_halts_with_its_reason[overrides6-vix_backwardation-vix_backwardation:1.2000>1.0] PASSED [ 51%]
+tests/risk/test_daemon_rules.py::test_each_failed_check_halts_with_its_reason[overrides6-vix_backwardation-vix_backwardation:1.2000>1.0] PASSED [ 50%]
 tests/risk/test_daemon_rules.py::test_each_failed_check_halts_with_its_reason[overrides7-missing_positions_snapshot-missing_positions_snapshot] PASSED [ 51%]
 tests/risk/test_daemon_rules.py::test_each_failed_check_halts_with_its_reason[overrides8-stale_positions_snapshot-stale_positions_snapshot:121.0s] PASSED [ 51%]
 tests/risk/test_daemon_rules.py::test_each_failed_check_halts_with_its_reason[overrides9-drawdown_breach-drawdown_breach:-5.00%<=-5.00%] PASSED [ 51%]
 tests/risk/test_daemon_rules.py::test_each_failed_check_halts_with_its_reason[overrides10-drawdown_breach-drawdown_breach:-6.00%<=-5.00%] PASSED [ 51%]
 tests/risk/test_daemon_rules.py::test_each_failed_check_halts_with_its_reason[overrides11-missing_surface:mft:surface:SPY.ARCA-missing_surface:mft:surface:SPY.ARCA] PASSED [ 51%]
 tests/risk/test_daemon_rules.py::test_each_failed_check_halts_with_its_reason[overrides12-stale_surface:mft:surface:SPY.ARCA-stale_surface:mft:surface:SPY.ARCA:121.0s] PASSED [ 51%]
-tests/risk/test_daemon_rules.py::test_each_failed_check_halts_with_its_reason[overrides13-missing_rv:mft:rv:SPY.ARCA-missing_rv:mft:rv:SPY.ARCA] PASSED [ 52%]
+tests/risk/test_daemon_rules.py::test_each_failed_check_halts_with_its_reason[overrides13-missing_rv:mft:rv:SPY.ARCA-missing_rv:mft:rv:SPY.ARCA] PASSED [ 51%]
 tests/risk/test_daemon_rules.py::test_each_failed_check_halts_with_its_reason[overrides14-stale_rv:mft:rv:SPY.ARCA-stale_rv:mft:rv:SPY.ARCA:172800s] PASSED [ 52%]
 tests/risk/test_daemon_rules.py::test_manual_flag_must_be_truthy PASSED  [ 52%]
 tests/risk/test_daemon_rules.py::test_reason_codes_are_stable_while_details_change PASSED [ 52%]
 tests/risk/test_daemon_rules.py::test_unusable_timestamps_fail_closed[<lambda>-mft:regime:latest-None] PASSED [ 52%]
 tests/risk/test_daemon_rules.py::test_unusable_timestamps_fail_closed[<lambda>-mft:regime:latest-recent] PASSED [ 52%]
-tests/risk/test_daemon_rules.py::test_unusable_timestamps_fail_closed[<lambda>-mft:regime:latest-1795533301000000000] PASSED [ 53%]
-tests/risk/test_daemon_rules.py::test_unusable_timestamps_fail_closed[<lambda>-mft:positions:latest-None] PASSED [ 53%]
+tests/risk/test_daemon_rules.py::test_unusable_timestamps_fail_closed[<lambda>-mft:regime:latest-1795533301000000000] PASSED [ 52%]
+tests/risk/test_daemon_rules.py::test_unusable_timestamps_fail_closed[<lambda>-mft:positions:latest-None] PASSED [ 52%]
 tests/risk/test_daemon_rules.py::test_unusable_timestamps_fail_closed[<lambda>-mft:positions:latest-recent] PASSED [ 53%]
 tests/risk/test_daemon_rules.py::test_unusable_timestamps_fail_closed[<lambda>-mft:positions:latest-1795533301000000000] PASSED [ 53%]
 tests/risk/test_daemon_rules.py::test_unusable_timestamps_fail_closed[<lambda>-mft:surface:SPY.ARCA-None] PASSED [ 53%]
 tests/risk/test_daemon_rules.py::test_unusable_timestamps_fail_closed[<lambda>-mft:surface:SPY.ARCA-recent] PASSED [ 53%]
 tests/risk/test_daemon_rules.py::test_unusable_timestamps_fail_closed[<lambda>-mft:surface:SPY.ARCA-1795533301000000000] PASSED [ 53%]
-tests/risk/test_daemon_rules.py::test_unusable_timestamps_fail_closed[<lambda>-mft:rv:SPY.ARCA-None] PASSED [ 54%]
+tests/risk/test_daemon_rules.py::test_unusable_timestamps_fail_closed[<lambda>-mft:rv:SPY.ARCA-None] PASSED [ 53%]
 tests/risk/test_daemon_rules.py::test_unusable_timestamps_fail_closed[<lambda>-mft:rv:SPY.ARCA-recent] PASSED [ 54%]
 tests/risk/test_daemon_rules.py::test_unusable_timestamps_fail_closed[<lambda>-mft:rv:SPY.ARCA-1795533301000000000] PASSED [ 54%]
 tests/risk/test_daemon_rules.py::test_invalid_timestamps_report_no_age PASSED [ 54%]
 tests/risk/test_daemon_rules.py::test_small_clock_skew_and_alternative_timestamp_fields_are_accepted PASSED [ 54%]
 tests/risk/test_daemon_rules.py::test_positions_snapshot_can_be_optional PASSED [ 54%]
 tests/risk/test_daemon_rules.py::test_reasons_follow_check_order PASSED  [ 54%]
-tests/risk/test_daemon_rules.py::test_sleeve_drawdown_sources PASSED     [ 55%]
+tests/risk/test_daemon_rules.py::test_sleeve_drawdown_sources PASSED     [ 54%]
 tests/risk/test_daemon_rules.py::test_state_ttl_covers_at_least_three_polls PASSED [ 55%]
 tests/risk/test_daemon_rules.py::test_transition_tracker PASSED          [ 55%]
 tests/risk/test_daemon_rules.py::test_recovery_after_an_error_is_a_transition PASSED [ 55%]
 tests/risk/test_gate_rules.py::test_daemon_block_reason_matrix[0-status0-None] PASSED [ 55%]
 tests/risk/test_gate_rules.py::test_daemon_block_reason_matrix[ 0\n-status1-None] PASSED [ 55%]
-tests/risk/test_gate_rules.py::test_daemon_block_reason_matrix[None-status2-RISK_DAEMON_HALTED_OR_MISSING] PASSED [ 56%]
-tests/risk/test_gate_rules.py::test_daemon_block_reason_matrix[1-status3-RISK_DAEMON_HALTED_OR_MISSING] PASSED [ 56%]
+tests/risk/test_gate_rules.py::test_daemon_block_reason_matrix[None-status2-RISK_DAEMON_HALTED_OR_MISSING] PASSED [ 55%]
+tests/risk/test_gate_rules.py::test_daemon_block_reason_matrix[1-status3-RISK_DAEMON_HALTED_OR_MISSING] PASSED [ 55%]
 tests/risk/test_gate_rules.py::test_daemon_block_reason_matrix[0-status4-RISK_DAEMON_HALTED_OR_MISSING] PASSED [ 56%]
 tests/risk/test_gate_rules.py::test_daemon_block_reason_matrix[0-None-RISK_DAEMON_HALTED_OR_MISSING] PASSED [ 56%]
 tests/risk/test_gate_rules.py::test_daemon_block_reason_matrix[0-status6-RISK_DAEMON_STALE(31s)] PASSED [ 56%]
 tests/risk/test_gate_rules.py::test_daemon_block_reason_matrix[0-status7-RISK_DAEMON_HALTED_OR_MISSING] PASSED [ 56%]
 tests/risk/test_gate_rules.py::test_daemon_block_reason_matrix[0-status8-RISK_DAEMON_HALTED_OR_MISSING] PASSED [ 56%]
-tests/risk/test_gate_rules.py::test_missing_stale_or_unusable_regime_blocks[payload0] PASSED [ 57%]
+tests/risk/test_gate_rules.py::test_missing_stale_or_unusable_regime_blocks[payload0] PASSED [ 56%]
 tests/risk/test_gate_rules.py::test_missing_stale_or_unusable_regime_blocks[payload1] PASSED [ 57%]
 tests/risk/test_gate_rules.py::test_missing_stale_or_unusable_regime_blocks[payload2] PASSED [ 57%]
 tests/risk/test_gate_rules.py::test_missing_stale_or_unusable_regime_blocks[payload3] PASSED [ 57%]
 tests/risk/test_gate_rules.py::test_regime_rules PASSED                  [ 57%]
 tests/risk/test_gate_rules.py::test_surface_rules[overrides0-expected0] PASSED [ 57%]
 tests/risk/test_gate_rules.py::test_surface_rules[overrides1-expected1] PASSED [ 57%]
-tests/risk/test_gate_rules.py::test_surface_rules[overrides2-expected2] PASSED [ 58%]
+tests/risk/test_gate_rules.py::test_surface_rules[overrides2-expected2] PASSED [ 57%]
 tests/risk/test_gate_rules.py::test_surface_rules[overrides3-expected3] PASSED [ 58%]
 tests/risk/test_gate_rules.py::test_surface_rules[overrides4-expected4] PASSED [ 58%]
 tests/risk/test_gate_rules.py::test_surface_rules[overrides5-expected5] PASSED [ 58%]
 tests/risk/test_gate_rules.py::test_surface_rules[overrides6-expected6] PASSED [ 58%]
 tests/risk/test_gate_rules.py::test_metrics_rules PASSED                 [ 58%]
-tests/risk/test_gate_rules.py::test_futures_cross_check_is_advisory_unless_valid[payload0-expected0] PASSED [ 59%]
-tests/risk/test_gate_rules.py::test_futures_cross_check_is_advisory_unless_valid[payload1-expected1] PASSED [ 59%]
+tests/risk/test_gate_rules.py::test_futures_cross_check_is_advisory_unless_valid[payload0-expected0] PASSED [ 58%]
+tests/risk/test_gate_rules.py::test_futures_cross_check_is_advisory_unless_valid[payload1-expected1] PASSED [ 58%]
 tests/risk/test_gate_rules.py::test_futures_cross_check_is_advisory_unless_valid[payload2-expected2] PASSED [ 59%]
 tests/risk/test_gate_rules.py::test_futures_cross_check_is_advisory_unless_valid[payload3-expected3] PASSED [ 59%]
 tests/risk/test_gate_rules.py::test_futures_cross_check_is_advisory_unless_valid[payload4-expected4] PASSED [ 59%]
 tests/risk/test_gate_rules.py::test_futures_cross_check_is_advisory_unless_valid[payload5-expected5] PASSED [ 59%]
 tests/risk/test_gate_rules.py::test_futures_cross_check_is_advisory_unless_valid[payload6-expected6] PASSED [ 59%]
-tests/risk/test_gate_rules.py::test_ev_rule[0.01-expected0] PASSED       [ 60%]
+tests/risk/test_gate_rules.py::test_ev_rule[0.01-expected0] PASSED       [ 59%]
 tests/risk/test_gate_rules.py::test_ev_rule[0.0-expected1] PASSED        [ 60%]
 tests/risk/test_gate_rules.py::test_ev_rule[-1.5-expected2] PASSED       [ 60%]
 tests/risk/test_gate_rules.py::test_portfolio_freshness_and_book_es99 PASSED [ 60%]
 tests/risk/test_gate_rules.py::test_fresh_but_unreadable_book_es99_blocks[payload0] PASSED [ 60%]
 tests/risk/test_gate_rules.py::test_fresh_but_unreadable_book_es99_blocks[payload1] PASSED [ 60%]
 tests/risk/test_gate_rules.py::test_fresh_but_unreadable_book_es99_blocks[payload2] PASSED [ 60%]
-tests/risk/test_gate_rules.py::test_fresh_but_unreadable_book_es99_blocks[payload3] PASSED [ 61%]
+tests/risk/test_gate_rules.py::test_fresh_but_unreadable_book_es99_blocks[payload3] PASSED [ 60%]
 tests/risk/test_gate_rules.py::test_fresh_but_unreadable_book_es99_blocks[payload4] PASSED [ 61%]
 tests/risk/test_gate_rules.py::test_unmodeled_positions_block_entry PASSED [ 61%]
 tests/risk/test_gate_rules.py::test_rate_limiter_counts_submissions_in_a_sliding_window PASSED [ 61%]
 tests/risk/test_gate_rules.py::test_healthy_leg_passes_uncapped PASSED   [ 61%]
 tests/risk/test_gate_rules.py::test_leg_block_reasons[overrides0-NON_STANDARD_CONTRACT(SPY P690, mult=10)] PASSED [ 61%]
-tests/risk/test_gate_rules.py::test_leg_block_reasons[overrides1-NON_STANDARD_CONTRACT(SPY P690, mult=100)] PASSED [ 62%]
-tests/risk/test_gate_rules.py::test_leg_block_reasons[overrides2-INVALID_QUOTE(SPY P690: 0.0/2.2)] PASSED [ 62%]
+tests/risk/test_gate_rules.py::test_leg_block_reasons[overrides1-NON_STANDARD_CONTRACT(SPY P690, mult=100)] PASSED [ 61%]
+tests/risk/test_gate_rules.py::test_leg_block_reasons[overrides2-INVALID_QUOTE(SPY P690: 0.0/2.2)] PASSED [ 61%]
 tests/risk/test_gate_rules.py::test_leg_block_reasons[overrides3-INVALID_QUOTE(SPY P690: 2.2/2.2)] PASSED [ 62%]
 tests/risk/test_gate_rules.py::test_leg_block_reasons[overrides4-WIDE_MIDCAP_SPREAD(SPY P690: 40.0%>18.0%)] PASSED [ 62%]
 tests/risk/test_gate_rules.py::test_leg_block_reasons[overrides5-OPEN_INTEREST_UNKNOWN(SPY P690)] PASSED [ 62%]
 tests/risk/test_gate_rules.py::test_leg_block_reasons[overrides6-LOW_OPEN_INTEREST(SPY P690: OI=50<100)] PASSED [ 62%]
 tests/risk/test_gate_rules.py::test_invalid_quote_skips_the_remaining_leg_checks PASSED [ 62%]
-tests/risk/test_gate_rules.py::test_unknown_open_interest_can_be_downgraded_to_a_warning PASSED [ 63%]
+tests/risk/test_gate_rules.py::test_unknown_open_interest_can_be_downgraded_to_a_warning PASSED [ 62%]
 tests/risk/test_gate_rules.py::test_low_open_interest_also_caps_size PASSED [ 63%]
 tests/risk/test_gate_rules.py::test_open_interest_then_top_of_book_caps PASSED [ 63%]
 tests/risk/test_gate_rules.py::test_top_of_book_side_follows_the_leg_side PASSED [ 63%]
 tests/risk/test_gate_rules.py::test_short_call_expiry_and_quantity_are_collected PASSED [ 63%]
 tests/risk/test_gate_rules.py::test_tob_size_zero_is_not_converted_and_rejected PASSED [ 63%]
-tests/risk/test_gate_rules.py::test_tob_size_none_rejected_when_unknown_not_allowed PASSED [ 64%]
-tests/risk/test_gate_rules.py::test_tob_size_none_allowed_as_warning_when_configured PASSED [ 64%]
+tests/risk/test_gate_rules.py::test_tob_size_none_rejected_when_unknown_not_allowed PASSED [ 63%]
+tests/risk/test_gate_rules.py::test_tob_size_none_allowed_as_warning_when_configured PASSED [ 63%]
 tests/risk/test_gate_rules.py::test_tob_participation_zero_blocks_when_cap_is_zero PASSED [ 64%]
 tests/risk/test_gate_rules.py::test_oi_participation_zero_blocks_when_cap_is_zero PASSED [ 64%]
 tests/risk/test_gate_rules.py::test_no_legs_means_nothing_to_trade PASSED [ 64%]
 tests/risk/test_gate_rules.py::test_es_budget_caps_lots PASSED           [ 64%]
 tests/risk/test_gate_rules.py::test_es_budget_exhausted[900.0] PASSED    [ 64%]
-tests/risk/test_gate_rules.py::test_es_budget_exhausted[1000.0] PASSED   [ 65%]
-tests/risk/test_gate_rules.py::test_es_budget_exhausted[1200.0] PASSED   [ 65%]
+tests/risk/test_gate_rules.py::test_es_budget_exhausted[1000.0] PASSED   [ 64%]
+tests/risk/test_gate_rules.py::test_es_budget_exhausted[1200.0] PASSED   [ 64%]
 tests/risk/test_gate_rules.py::test_zero_incremental_tail_risk_is_rejected PASSED [ 65%]
 tests/risk/test_pre_trade_gate.py::test_healthy_inputs_approve_the_requested_size PASSED [ 65%]
 tests/risk/test_pre_trade_gate.py::test_each_failed_input_blocks_with_its_reason[<lambda>-eval_kwargs0-RISK_DAEMON_HALTED_OR_MISSING] PASSED [ 65%]
 tests/risk/test_pre_trade_gate.py::test_each_failed_input_blocks_with_its_reason[<lambda>-eval_kwargs1-RISK_DAEMON_STALE(31s)] PASSED [ 65%]
 tests/risk/test_pre_trade_gate.py::test_each_failed_input_blocks_with_its_reason[<lambda>-eval_kwargs2-MACRO_REGIME_BLOCKED(ratio=0.8824)] PASSED [ 65%]
-tests/risk/test_pre_trade_gate.py::test_each_failed_input_blocks_with_its_reason[<lambda>-eval_kwargs3-SVI_SURFACE_MISSING_OR_STALE] PASSED [ 66%]
+tests/risk/test_pre_trade_gate.py::test_each_failed_input_blocks_with_its_reason[<lambda>-eval_kwargs3-SVI_SURFACE_MISSING_OR_STALE] PASSED [ 65%]
 tests/risk/test_pre_trade_gate.py::test_each_failed_input_blocks_with_its_reason[<lambda>-eval_kwargs4-SVI_FIT_POOR(rmse=0.8pts>0.5)] PASSED [ 66%]
 tests/risk/test_pre_trade_gate.py::test_each_failed_input_blocks_with_its_reason[<lambda>-eval_kwargs5-SURFACE_BIAS_DEFENSIVE(VRP=0.03)] PASSED [ 66%]
 tests/risk/test_pre_trade_gate.py::test_each_failed_input_blocks_with_its_reason[<lambda>-eval_kwargs6-FUTURES_PARITY_DIVERGENCE(30.0bps)] PASSED [ 66%]
 tests/risk/test_pre_trade_gate.py::test_each_failed_input_blocks_with_its_reason[<lambda>-eval_kwargs7-NON_POSITIVE_NET_EV($-1.00/lot)] PASSED [ 66%]
 tests/risk/test_pre_trade_gate.py::test_each_failed_input_blocks_with_its_reason[<lambda>-eval_kwargs8-OPEN_INTEREST_UNKNOWN(SPY P685)] PASSED [ 66%]
-tests/risk/test_pre_trade_gate.py::test_each_failed_input_blocks_with_its_reason[<lambda>-eval_kwargs9-PORTFOLIO_RISK_MISSING_OR_STALE] PASSED [ 67%]
-tests/risk/test_pre_trade_gate.py::test_each_failed_input_blocks_with_its_reason[<lambda>-eval_kwargs10-PORTFOLIO_RISK_INVALID] PASSED [ 67%]
+tests/risk/test_pre_trade_gate.py::test_each_failed_input_blocks_with_its_reason[<lambda>-eval_kwargs9-PORTFOLIO_RISK_MISSING_OR_STALE] PASSED [ 66%]
+tests/risk/test_pre_trade_gate.py::test_each_failed_input_blocks_with_its_reason[<lambda>-eval_kwargs10-PORTFOLIO_RISK_INVALID] PASSED [ 66%]
 tests/risk/test_pre_trade_gate.py::test_each_failed_input_blocks_with_its_reason[<lambda>-eval_kwargs11-SLEEVE_ES99_BUDGET_EXHAUSTED(cur=$1000+$150>$1000)] PASSED [ 67%]
 tests/risk/test_pre_trade_gate.py::test_reasons_keep_the_documented_order PASSED [ 67%]
 tests/risk/test_pre_trade_gate.py::test_advisory_inputs_only_warn PASSED [ 67%]
 tests/risk/test_pre_trade_gate.py::test_tail_budget_caps_the_approved_size PASSED [ 67%]
 tests/risk/test_pre_trade_gate.py::test_short_call_details_reach_the_calendar PASSED [ 67%]
-tests/risk/test_pre_trade_gate.py::test_default_as_of_is_the_new_york_trading_date PASSED [ 68%]
-tests/risk/test_pre_trade_gate.py::test_explicit_as_of_wins PASSED       [ 68%]
+tests/risk/test_pre_trade_gate.py::test_default_as_of_is_the_new_york_trading_date PASSED [ 67%]
+tests/risk/test_pre_trade_gate.py::test_explicit_as_of_wins PASSED       [ 67%]
 tests/risk/test_pre_trade_gate.py::test_without_a_store_the_daemon_is_unreachable PASSED [ 68%]
 tests/risk/test_pre_trade_gate.py::test_evaluations_do_not_consume_the_throttle_but_submissions_do PASSED [ 68%]
 tests/risk/test_pre_trade_gate.py::test_default_calendar_is_only_built_when_none_is_injected PASSED [ 68%]
 tests/risk/test_pre_trade_gate.py::test_wall_clock_is_injected PASSED    [ 68%]
 tests/risk/test_risk_daemon.py::test_healthy_evaluation_publishes_state_with_ttl PASSED [ 68%]
-tests/risk/test_risk_daemon.py::test_history_is_capped_newest_first PASSED [ 69%]
+tests/risk/test_risk_daemon.py::test_history_is_capped_newest_first PASSED [ 68%]
 tests/risk/test_risk_daemon.py::test_transitions_are_logged_only_when_reason_codes_change PASSED [ 69%]
 tests/risk/test_risk_daemon.py::test_heartbeats_go_to_the_sink_between_transitions PASSED [ 69%]
 tests/risk/test_risk_daemon.py::test_unusable_timestamp_halts_end_to_end PASSED [ 69%]
 tests/risk/test_risk_daemon.py::test_evaluation_error_publishes_a_halt_and_recovery_is_a_transition PASSED [ 69%]
 tests/risk/test_risk_daemon.py::test_daemon_survives_an_unreachable_store_and_a_failing_disk PASSED [ 69%]
-tests/risk/test_risk_daemon.py::test_error_events_reach_the_sink_when_the_store_is_down PASSED [ 70%]
-tests/risk/test_risk_daemon.py::test_stop_ends_the_loop PASSED           [ 70%]
+tests/risk/test_risk_daemon.py::test_error_events_reach_the_sink_when_the_store_is_down PASSED [ 69%]
+tests/risk/test_risk_daemon.py::test_stop_ends_the_loop PASSED           [ 69%]
 tests/risk/test_risk_daemon.py::test_constructor_does_not_touch_the_filesystem PASSED [ 70%]
 tests/risk/test_risk_daemon.py::test_print_summary PASSED                [ 70%]
 tests/risk/test_risk_daemon.py::test_print_summary_without_valkey PASSED [ 70%]
 tests/risk/test_scenario_pricer.py::test_repeated_evaluations_see_identical_scenarios PASSED [ 70%]
 tests/risk/test_scenario_pricer.py::test_seed_changes_the_scenarios PASSED [ 70%]
-tests/risk/test_scenario_pricer.py::test_friction_is_half_spread_plus_commissions PASSED [ 71%]
-tests/risk/test_scenario_pricer.py::test_rich_credit_is_approved_and_sized PASSED [ 71%]
+tests/risk/test_scenario_pricer.py::test_friction_is_half_spread_plus_commissions PASSED [ 70%]
+tests/risk/test_scenario_pricer.py::test_rich_credit_is_approved_and_sized PASSED [ 70%]
 tests/risk/test_scenario_pricer.py::test_negative_expected_value_is_rejected_with_zero_size PASSED [ 71%]
 tests/risk/test_scenario_pricer.py::test_stress_grid_shape_labels_and_direction PASSED [ 71%]
 tests/risk/test_scenario_pricer.py::test_pricing_function_gets_the_true_rate_and_the_dividend_yield PASSED [ 71%]
 tests/risk/test_scenario_pricer.py::test_margin_estimates PASSED         [ 71%]
 tests/risk/test_scenario_pricer.py::test_default_price_function_matches_quantlib PASSED [ 71%]
-tests/runtime/test_ib_node.py::test_provider_loads_the_requested_ids PASSED [ 72%]
+tests/runtime/test_ib_node.py::test_provider_loads_the_requested_ids PASSED [ 71%]
 tests/runtime/test_ib_node.py::test_client_configs_carry_connection_settings PASSED [ 72%]
 tests/runtime/test_ib_node.py::test_node_config_with_and_without_execution PASSED [ 72%]
 tests/runtime/test_instruments.py::test_occ_option_ids PASSED            [ 72%]
 tests/runtime/test_instruments.py::test_spy_slice_matches_what_is_loaded PASSED [ 72%]
 tests/runtime/test_instruments.py::test_option_ids_and_ib_contracts_come_from_the_same_slice PASSED [ 72%]
-tests/runtime/test_instruments.py::test_vol_actor_default_strike_range_covers_the_slice PASSED [ 73%]
-tests/runtime/test_instruments.py::test_future_contract_and_universes PASSED [ 73%]
+tests/runtime/test_instruments.py::test_vol_actor_default_strike_range_covers_the_slice PASSED [ 72%]
+tests/runtime/test_instruments.py::test_future_contract_and_universes PASSED [ 72%]
 tests/scanner/test_surface_scanner.py::test_without_model_edge_candidates_rank_by_credit PASSED [ 73%]
 tests/scanner/test_surface_scanner.py::test_iron_condor_uses_the_nearest_out_of_the_money_wings PASSED [ 73%]
 tests/scanner/test_surface_scanner.py::test_model_edge_reorders_candidates PASSED [ 73%]
 tests/scanner/test_surface_scanner.py::test_candidate_limit PASSED       [ 73%]
 tests/scanner/test_surface_scanner.py::test_blocked_inputs_produce_nothing PASSED [ 73%]
-tests/scanner/test_surface_scanner.py::test_condor_needs_two_wings_on_each_side PASSED [ 74%]
-tests/scanner/test_verticals.py::test_split_by_right_sorts_by_strike PASSED [ 74%]
+tests/scanner/test_surface_scanner.py::test_condor_needs_two_wings_on_each_side PASSED [ 73%]
+tests/scanner/test_verticals.py::test_split_by_right_sorts_by_strike PASSED [ 73%]
 tests/scanner/test_verticals.py::test_adjacent_verticals_with_width_and_credit_filters PASSED [ 74%]
 tests/scanner/test_verticals.py::test_credit_threshold_is_exclusive_and_configurable PASSED [ 74%]
 tests/scanner/test_verticals.py::test_duplicate_strikes_never_pair PASSED [ 74%]
 tests/scanner/test_verticals.py::test_names PASSED                       [ 74%]
-tests/scanner/test_verticals.py::test_candidate_leg_copies_the_row PASSED [ 75%]
-tests/scanner/test_verticals.py::test_edge_helpers PASSED                [ 75%]
+tests/scanner/test_verticals.py::test_candidate_leg_copies_the_row PASSED [ 74%]
+tests/scanner/test_verticals.py::test_edge_helpers PASSED                [ 74%]
 tests/scanner/test_verticals.py::test_vertical_combo_fields PASSED       [ 75%]
 tests/services/test_futures_basis.py::test_basis_round_trips_the_carry_of_a_consistent_futures_price PASSED [ 75%]
 tests/services/test_futures_basis.py::test_basis_needs_a_ratio_and_a_futures_expiry PASSED [ 75%]
 tests/services/test_futures_basis.py::test_parity_comparison_needs_the_surface PASSED [ 75%]
 tests/services/test_futures_basis.py::test_ratio_needs_both_closes_of_the_same_minute PASSED [ 75%]
-tests/services/test_futures_basis.py::test_older_minutes_never_replace_a_newer_ratio PASSED [ 76%]
-tests/services/test_futures_basis.py::test_ratio_ignores_other_instruments_bad_closes_and_bounds_memory PASSED [ 76%]
+tests/services/test_futures_basis.py::test_older_minutes_never_replace_a_newer_ratio PASSED [ 75%]
+tests/services/test_futures_basis.py::test_ratio_ignores_other_instruments_bad_closes_and_bounds_memory PASSED [ 75%]
 tests/services/test_futures_basis.py::test_waits_for_fresh_spy_and_mes_quotes PASSED [ 76%]
 tests/services/test_futures_basis.py::test_full_cross_check PASSED       [ 76%]
 tests/services/test_futures_basis.py::test_stale_ratio_disables_the_cross_check PASSED [ 76%]
 tests/services/test_futures_basis.py::test_stale_surface_keeps_futures_carry_but_no_parity_comparison PASSED [ 76%]
 tests/services/test_futures_basis.py::test_unknown_futures_expiry_disables_carry PASSED [ 76%]
-tests/services/test_futures_basis.py::test_without_an_index_feed_bars_are_ignored PASSED [ 77%]
-tests/services/test_futures_basis.py::test_trades_update_mids_and_bad_prints_are_ignored PASSED [ 77%]
+tests/services/test_futures_basis.py::test_without_an_index_feed_bars_are_ignored PASSED [ 76%]
+tests/services/test_futures_basis.py::test_trades_update_mids_and_bad_prints_are_ignored PASSED [ 76%]
 tests/services/test_portfolio_marks.py::test_same_expiry_uses_the_slice_forward PASSED [ 77%]
 tests/services/test_portfolio_marks.py::test_other_expiries_map_their_own_atm_onto_the_slice_atm PASSED [ 77%]
 tests/services/test_portfolio_marks.py::test_smile_lookup_needs_a_usable_slice[surface0-700.0-690.0] PASSED [ 77%]
 tests/services/test_portfolio_marks.py::test_smile_lookup_needs_a_usable_slice[surface1-700.0-690.0] PASSED [ 77%]
-tests/services/test_portfolio_marks.py::test_smile_lookup_needs_a_usable_slice[surface2-0.0-690.0] PASSED [ 78%]
-tests/services/test_portfolio_marks.py::test_short_put_exposure_signs_and_scaling PASSED [ 78%]
-tests/services/test_portfolio_marks.py::test_beta_weighting_and_live_marks PASSED [ 78%]
+tests/services/test_portfolio_marks.py::test_smile_lookup_needs_a_usable_slice[surface2-0.0-690.0] PASSED [ 77%]
+tests/services/test_portfolio_marks.py::test_short_put_exposure_signs_and_scaling PASSED [ 77%]
+tests/services/test_portfolio_marks.py::test_beta_weighting_and_live_marks PASSED [ 77%]
 tests/services/test_portfolio_marks.py::test_iv_fallbacks_without_a_smile[surface0-rv0-0.21] PASSED [ 78%]
 tests/services/test_portfolio_marks.py::test_iv_fallbacks_without_a_smile[surface1-rv1-0.17] PASSED [ 78%]
 tests/services/test_portfolio_marks.py::test_iv_fallbacks_without_a_smile[surface2-rv2-0.2] PASSED [ 78%]
 tests/services/test_portfolio_marks.py::test_linear_leg_stress PASSED    [ 78%]
-tests/services/test_portfolio_marks.py::test_option_leg_has_no_pnl_without_shocks_or_time PASSED [ 79%]
-tests/services/test_portfolio_marks.py::test_book_grid_shape_and_direction_for_a_long_put PASSED [ 79%]
+tests/services/test_portfolio_marks.py::test_option_leg_has_no_pnl_without_shocks_or_time PASSED [ 78%]
+tests/services/test_portfolio_marks.py::test_book_grid_shape_and_direction_for_a_long_put PASSED [ 78%]
 tests/services/test_portfolio_marks.py::test_empty_book_grid_is_zero PASSED [ 79%]
 tests/services/test_portfolio_marks.py::test_attribution_explains_pnl_with_baseline_greeks PASSED [ 79%]
 tests/services/test_portfolio_marks.py::test_attribution_rebases_on_a_new_day_or_book[2026-11-25-book0] PASSED [ 79%]
 tests/services/test_portfolio_marks.py::test_attribution_rebases_on_a_new_day_or_book[2026-11-24-book1] PASSED [ 79%]
 tests/services/test_portfolio_marks.py::test_attribution_waits_for_a_benchmark_price PASSED [ 79%]
-tests/services/test_portfolio_marks.py::test_sleeve_tracks_high_water_mark_and_drawdown PASSED [ 80%]
-tests/services/test_portfolio_marks.py::test_sleeve_restores_carry_and_high_water_mark PASSED [ 80%]
+tests/services/test_portfolio_marks.py::test_sleeve_tracks_high_water_mark_and_drawdown PASSED [ 79%]
+tests/services/test_portfolio_marks.py::test_sleeve_restores_carry_and_high_water_mark PASSED [ 79%]
 tests/services/test_portfolio_service.py::test_empty_book_publishes_flat_risk_and_sleeve PASSED [ 80%]
 tests/services/test_portfolio_service.py::test_share_position_marks_live_and_stresses_linearly PASSED [ 80%]
 tests/services/test_portfolio_service.py::test_share_mark_fallbacks[SPY.ARCA-quotes0-ACTOR_SPOT-700.0] PASSED [ 80%]
 tests/services/test_portfolio_service.py::test_share_mark_fallbacks[SPY.ARCA-quotes1-ACTOR_SPOT-700.0] PASSED [ 80%]
-tests/services/test_portfolio_service.py::test_share_mark_fallbacks[IWM.ARCA-quotes2-ENTRY_PRICE-690.0] PASSED [ 81%]
-tests/services/test_portfolio_service.py::test_short_option_is_marked_at_its_live_mid_with_model_greeks PASSED [ 81%]
-tests/services/test_portfolio_service.py::test_registered_spread_is_decomposed_into_option_legs PASSED [ 81%]
+tests/services/test_portfolio_service.py::test_share_mark_fallbacks[IWM.ARCA-quotes2-ENTRY_PRICE-690.0] PASSED [ 80%]
+tests/services/test_portfolio_service.py::test_short_option_is_marked_at_its_live_mid_with_model_greeks PASSED [ 80%]
+tests/services/test_portfolio_service.py::test_registered_spread_is_decomposed_into_option_legs PASSED [ 80%]
 tests/services/test_portfolio_service.py::test_spread_with_one_unquoted_leg_has_mixed_marks PASSED [ 81%]
 tests/services/test_portfolio_service.py::test_spread_without_usable_legs_is_not_modelled[None] PASSED [ 81%]
 tests/services/test_portfolio_service.py::test_spread_without_usable_legs_is_not_modelled[not a list] PASSED [ 81%]
 tests/services/test_portfolio_service.py::test_spread_without_usable_legs_is_not_modelled[legs2] PASSED [ 81%]
-tests/services/test_portfolio_service.py::test_spread_without_usable_legs_is_not_modelled[legs3] PASSED [ 82%]
-tests/services/test_portfolio_service.py::test_spread_without_usable_legs_is_not_modelled[legs4] PASSED [ 82%]
+tests/services/test_portfolio_service.py::test_spread_without_usable_legs_is_not_modelled[legs3] PASSED [ 81%]
+tests/services/test_portfolio_service.py::test_spread_without_usable_legs_is_not_modelled[legs4] PASSED [ 81%]
 tests/services/test_portfolio_service.py::test_option_on_an_unpriced_underlying PASSED [ 82%]
 tests/services/test_portfolio_service.py::test_underlying_spot_falls_back_to_a_live_quote PASSED [ 82%]
 tests/services/test_portfolio_service.py::test_realized_pnl_and_restored_sleeve_state PASSED [ 82%]
 tests/services/test_portfolio_service.py::test_attribution_runs_across_evaluations PASSED [ 82%]
 tests/services/test_portfolio_service.py::test_unmodeled_spread_sets_flag PASSED [ 82%]
-tests/services/test_portfolio_service.py::test_registered_spread_does_not_set_unmodeled_flag PASSED [ 83%]
-tests/services/test_portfolio_service.py::test_horizon_var_es_is_nonlinear_14d PASSED [ 83%]
+tests/services/test_portfolio_service.py::test_registered_spread_does_not_set_unmodeled_flag PASSED [ 82%]
+tests/services/test_portfolio_service.py::test_horizon_var_es_is_nonlinear_14d PASSED [ 82%]
+tests/services/test_portfolio_service.py::test_surfaces_are_keyed_by_symbol PASSED [ 83%]
+tests/services/test_portfolio_service.py::test_defined_risk_credit_spread_es99_is_bounded PASSED [ 83%]
+tests/services/test_portfolio_service.py::test_beta_hedged_short_gamma_produces_tail_risk PASSED [ 83%]
 tests/services/test_realized_vol_service.py::test_warm_start_loads_available_histories PASSED [ 83%]
 tests/services/test_realized_vol_service.py::test_evaluate_publishes_each_instrument_and_the_universe PASSED [ 83%]
 tests/services/test_realized_vol_service.py::test_nothing_is_published_without_history PASSED [ 83%]
@@ -594,14 +601,14 @@ tests/services/test_realized_vol_service.py::test_extended_hours_and_weekend_pri
 tests/services/test_realized_vol_service.py::test_next_session_rolls_the_previous_one_into_history PASSED [ 84%]
 tests/services/test_realized_vol_service.py::test_completed_daily_bar_replaces_the_live_session PASSED [ 84%]
 tests/services/test_realized_vol_service.py::test_history_is_capped PASSED [ 84%]
-tests/services/test_regime.py::test_no_signal_until_both_levels_are_known PASSED [ 84%]
+tests/services/test_regime.py::test_no_signal_until_both_levels_are_known PASSED [ 85%]
 tests/services/test_regime.py::test_contango_allows_short_vol_and_publishes PASSED [ 85%]
 tests/services/test_regime.py::test_backwardation_blocks_short_vol PASSED [ 85%]
 tests/services/test_regime.py::test_stale_levels_block_short_vol_even_in_contango PASSED [ 85%]
 tests/services/test_regime.py::test_newest_observation_wins_across_quotes_and_bars PASSED [ 85%]
 tests/services/test_regime.py::test_unusable_inputs_are_ignored PASSED   [ 85%]
 tests/services/test_regime.py::test_staleness_boundary[90.0-False] PASSED [ 85%]
-tests/services/test_regime.py::test_staleness_boundary[90.5-True] PASSED [ 85%]
+tests/services/test_regime.py::test_staleness_boundary[90.5-True] PASSED [ 86%]
 tests/services/test_regime.py::test_zero_vix3m_level_gives_no_state PASSED [ 86%]
 tests/services/test_surface_metrics_service.py::test_no_surface_no_metrics PASSED [ 86%]
 tests/services/test_surface_metrics_service.py::test_metrics_payload_from_atm_and_skew_fallback PASSED [ 86%]
@@ -614,7 +621,7 @@ tests/services/test_surface_metrics_service.py::test_technicals_drive_the_trend_
 tests/services/test_surface_metrics_service.py::test_only_new_daily_bars_of_the_underlying_feed_indicators PASSED [ 87%]
 tests/services/test_vol_surface.py::test_select_slice_options_filters_and_orders PASSED [ 87%]
 tests/services/test_vol_surface.py::test_configure_keeps_the_configured_slice_when_nothing_is_cached PASSED [ 87%]
-tests/services/test_vol_surface.py::test_aggregation_weights_shared_strikes PASSED [ 87%]
+tests/services/test_vol_surface.py::test_aggregation_weights_shared_strikes PASSED [ 88%]
 tests/services/test_vol_surface.py::test_calibrated_slice_is_published PASSED [ 88%]
 tests/services/test_vol_surface.py::test_inversion_uses_the_dividend_discounted_spot_and_the_true_rate PASSED [ 88%]
 tests/services/test_vol_surface.py::test_parity_pairs_set_the_forward PASSED [ 88%]
@@ -634,7 +641,7 @@ tests/strategies/test_vrp_core.py::test_exit_reason[14-0.5-TIME_STOP(dte=14<=14)
 tests/strategies/test_vrp_core.py::test_exit_reason[14-0.1-TIME_STOP(dte=14<=14)] PASSED [ 90%]
 tests/strategies/test_vrp_core.py::test_exit_reason[15-0.3-PROFIT_TARGET(mid_debit=0.30<=0.30)] PASSED [ 90%]
 tests/strategies/test_vrp_core.py::test_exit_reason[15-0.31-None] PASSED [ 90%]
-tests/strategies/test_vrp_core.py::test_exit_reason[15-None-None] PASSED [ 90%]
+tests/strategies/test_vrp_core.py::test_exit_reason[15-None-None] PASSED [ 91%]
 tests/strategies/test_vrp_core.py::test_exit_confirmation_by_spread_or_leg_positions PASSED [ 91%]
 tests/strategies/test_vrp_core.py::test_entry_block_reason[True-700.0-0-0-ORDER_WORKING] PASSED [ 91%]
 tests/strategies/test_vrp_core.py::test_entry_block_reason[False-0.0-0-0-NO_UNDERLYING_QUOTE] PASSED [ 91%]
@@ -654,7 +661,7 @@ tests/strategies/test_vrp_core.py::test_open_interest_and_expiry_sources PASSED 
 tests/strategies/test_vrp_core.py::test_missing_vols_default_to_atm PASSED [ 93%]
 tests/strategies/test_vrp_core.py::test_gate_leg_carries_the_real_extrinsic_value PASSED [ 93%]
 tests/strategies/test_vrp_core.py::test_candidates_are_adjacent_credit_spreads PASSED [ 93%]
-tests/strategies/test_vrp_core.py::test_live_underlying_mid_overrides_the_surface_spot PASSED [ 93%]
+tests/strategies/test_vrp_core.py::test_live_underlying_mid_overrides_the_surface_spot PASSED [ 94%]
 tests/strategies/test_vrp_core.py::test_no_spot_or_no_legs_means_no_candidates PASSED [ 94%]
 tests/strategies/test_vrp_core.py::test_credit_at_or_below_five_cents_is_skipped PASSED [ 94%]
 tests/strategies/test_vrp_core.py::test_per_lot_risk_floors_tail_loss_and_requests_at_least_one_lot PASSED [ 94%]
@@ -674,7 +681,7 @@ tests/strategies/test_vrp_engine.py::test_adverse_spot_move_cancels PASSED [ 96%
 tests/strategies/test_vrp_engine.py::test_dwell_reprices_and_failed_reprices_cancel PASSED [ 96%]
 tests/strategies/test_vrp_engine.py::test_non_positive_spread_mid_cancels PASSED [ 96%]
 tests/strategies/test_vrp_engine.py::test_orders_closed_behind_our_back_are_finalized[CANCELED-CANCELED] PASSED [ 96%]
-tests/strategies/test_vrp_engine.py::test_orders_closed_behind_our_back_are_finalized[None-missing from cache] PASSED [ 96%]
+tests/strategies/test_vrp_engine.py::test_orders_closed_behind_our_back_are_finalized[None-missing from cache] PASSED [ 97%]
 tests/strategies/test_vrp_engine.py::test_pending_orders_are_left_alone PASSED [ 97%]
 tests/strategies/test_vrp_engine.py::test_stop_cancels_open_orders_and_persists_the_book PASSED [ 97%]
 tests/strategies/test_vrp_engine.py::test_invalid_rv_blocks_entries_but_allows_exits[rv_overrides0] PASSED [ 97%]
@@ -696,14 +703,40 @@ tests/strategies/test_vrp_income_shell.py::test_shadow_timer_publishes_with_the_
 tests/strategies/test_vrp_income_shell.py::test_live_entry_goes_through_the_nautilus_gateway PASSED [ 99%]
 tests/strategies/test_vrp_income_shell.py::test_order_events_are_forwarded PASSED [100%]
 
-============================= 664 passed in 9.08s ==============================
+============================= 668 passed in 8.39s ==============================
 
 === FULL GIT DIFF (src/ & tests/) ===
+diff --git a/src/adapters/extract.py b/src/adapters/extract.py
+index 1eca117..0233906 100644
+--- a/src/adapters/extract.py
++++ b/src/adapters/extract.py
+@@ -62,7 +62,20 @@ def instrument_info(instrument: Any, kind: str) -> InstrumentInfo:
+         spec = option_spec_from_instrument(instrument)
+         return InstrumentInfo(OPTION, spec.multiplier, spec)
+     default = 100.0 if kind == OPTION_SPREAD else 1.0
+-    return InstrumentInfo(kind, float(getattr(instrument, "multiplier", default) or default))
++    mult = float(getattr(instrument, "multiplier", default) or default)
++    # Populate spread_legs from OptionSpread.info["legs"] if available
++    info = getattr(instrument, "info", None) or {}
++    raw_legs = info.get("legs") if isinstance(info, dict) else None
++    spread_legs: tuple[tuple[str, int], ...] | None = None
++    if isinstance(raw_legs, (list, tuple)):
++        try:
++            spread_legs = tuple(
++                (str(leg.get("instrument_id", "")), int(leg.get("ratio", 1)))
++                for leg in raw_legs if isinstance(leg, dict)
++            ) or None
++        except (TypeError, ValueError):
++            pass
++    return InstrumentInfo(kind, mult, spread_legs=spread_legs)
+ 
+ 
+ def position_view(position: Any) -> PositionView:
 diff --git a/src/quant/realized_vol.py b/src/quant/realized_vol.py
-index c472b2b..b2c3e70 100644
+index c472b2b..be67080 100644
 --- a/src/quant/realized_vol.py
 +++ b/src/quant/realized_vol.py
-@@ -10,25 +10,62 @@ from scipy.stats import percentileofscore
+@@ -10,25 +10,68 @@ from scipy.stats import percentileofscore
  from src.common.constants import NY_TZ_NAME, TRADING_DAYS_PER_YEAR
  
  
@@ -713,7 +746,8 @@ index c472b2b..b2c3e70 100644
 +    Applies three checks in order:
 +    1. Any of ``open``, ``high``, ``low``, ``close`` is non-finite or ≤ 0.
 +    2. OHLC consistency: ``high < max(open, close)`` or ``low > min(open, close)``.
-+    3. Outlier spike: ``|ln(C_t / C_{t-1})| > max_abs_log_ret`` (skip first row).
++    3. Outlier spike: |ln(C_t / last_accepted_close)| > max_abs_log_ret checked *sequentially*
++       so a single 10x spike bar does not also drop the valid bar right after it.
 +    """
 +    required = ("open", "high", "low", "close")
 +    if df.empty or any(col not in df for col in required):
@@ -729,11 +763,16 @@ index c472b2b..b2c3e70 100644
 +    if len(df) < 2:
 +        return df
 +
++    # Sequential outlier check: each row's close is compared to the *last accepted* close
 +    closes = df["close"].to_numpy(dtype=np.float64)
-+    log_rets = np.abs(np.log(closes / np.concatenate([[closes[0]], closes[:-1]])))
-+    outlier = np.zeros(len(df), dtype=bool)
-+    outlier[1:] = log_rets[1:] > max_abs_log_ret
-+    return df.loc[~outlier]
++    keep = np.ones(len(df), dtype=bool)
++    last_accepted = closes[0]
++    for i in range(1, len(df)):
++        if abs(np.log(closes[i] / last_accepted)) > max_abs_log_ret:
++            keep[i] = False  # drop this spike bar
++        else:
++            last_accepted = closes[i]  # only update on accepted rows
++    return df.loc[keep]
 +
 +
  def yang_zhang_rv(df: pd.DataFrame, window: int, ann: int = TRADING_DAYS_PER_YEAR) -> float:
@@ -771,7 +810,7 @@ index c472b2b..b2c3e70 100644
      prev_close = sub["close"].shift(1)
      log_oc = np.log(sub["open"] / prev_close).iloc[1:]
      log_co = np.log(sub["close"] / sub["open"]).iloc[1:]
-@@ -46,7 +83,11 @@ def yang_zhang_rv(df: pd.DataFrame, window: int, ann: int = TRADING_DAYS_PER_YEA
+@@ -46,7 +89,11 @@ def yang_zhang_rv(df: pd.DataFrame, window: int, ann: int = TRADING_DAYS_PER_YEA
  
  
  def bipower_jump_ratio(df: pd.DataFrame, window: int = 20) -> float:
@@ -784,7 +823,7 @@ index c472b2b..b2c3e70 100644
      if window <= 0 or df.empty or "close" not in df:
          return 0.0
      closes = df["close"].to_numpy(dtype=np.float64)
-@@ -59,8 +100,10 @@ def bipower_jump_ratio(df: pd.DataFrame, window: int = 20) -> float:
+@@ -59,8 +106,10 @@ def bipower_jump_ratio(df: pd.DataFrame, window: int = 20) -> float:
      rv = float(np.sum(r ** 2))
      if rv <= 1e-12:
          return 0.0
@@ -797,35 +836,7 @@ index c472b2b..b2c3e70 100644
      return float(np.clip((rv - bv) / rv, 0.0, 1.0))
  
  
-@@ -112,17 +155,106 @@ def percentile_rank(
-     return float(round(pct, decimals)) if decimals is not None else pct
- 
- 
-+def _yz_rv_clean(sub: pd.DataFrame, window: int, ann: int) -> float:
-+    """Internal YZ RV on a sanitised slice (assumes sub has at least 2 rows and valid OHLC)."""
-+    if len(sub) < window + 1:
-+        rets = np.log(sub["close"] / sub["close"].shift(1)).dropna()
-+        return float(rets.std(ddof=1) * np.sqrt(ann)) if len(rets) > 1 else 0.0
-+
-+    prev_close = sub["close"].shift(1)
-+    log_oc = np.log(sub["open"] / prev_close).iloc[1:]
-+    log_co = np.log(sub["close"] / sub["open"]).iloc[1:]
-+    log_ho = np.log(sub["high"] / sub["open"]).iloc[1:]
-+    log_lo = np.log(sub["low"] / sub["open"]).iloc[1:]
-+    log_hc = np.log(sub["high"] / sub["close"]).iloc[1:]
-+    log_lc = np.log(sub["low"] / sub["close"]).iloc[1:]
-+
-+    rs = (log_ho * log_hc + log_lo * log_lc).mean()
-+    var_o = log_oc.var(ddof=1)
-+    var_c = log_co.var(ddof=1)
-+    k = 0.34 / (1.34 + (window + 1) / max(window - 1, 1))
-+    yz_var = max(float(var_o + k * var_c + (1.0 - k) * rs), 1e-10)
-+    return float(np.sqrt(yz_var * ann))
-+
-+
- def trailing_rolling_rv(
-     df: pd.DataFrame,
-     window: int = 20,
+@@ -118,11 +167,74 @@ def trailing_rolling_rv(
      ann: int = TRADING_DAYS_PER_YEAR,
      lookback: int | None = None,
  ) -> np.ndarray:
@@ -847,13 +858,9 @@ index c472b2b..b2c3e70 100644
 +
 +    # Pre-sanitize once
 +    clean = sanitize_ohlc(df)
-+    if len(clean) < window + 1:
++    kept_idx = len(clean)
++    if kept_idx < window + 1:
 +        return np.array([], dtype=np.float64)
-+
-+    # Build mapping from original row positions to number of kept rows
-+    kept = np.zeros(n + 1, dtype=np.intp)
-+    kept[1:] = np.cumsum(np.isin(np.arange(n), clean.index.to_numpy()))
-+    kept_idx = kept[n]  # total kept rows
 +
 +    # Truncate to the last lookback windows
 +    first_kept = max(window + 1, kept_idx - lookback_val + 1)
@@ -861,7 +868,6 @@ index c472b2b..b2c3e70 100644
 +        return np.array([], dtype=np.float64)
 +
 +    w = window
-+    n_comp = kept_idx - 1  # number of usable log returns
 +    out_len = kept_idx - first_kept + 1
 +    result = np.empty(out_len, dtype=np.float64)
 +
@@ -879,6 +885,7 @@ index c472b2b..b2c3e70 100644
 +    log_lc = np.log(l_arr[1:] / c_arr[1:])
 +
 +    rs_t = log_ho * log_hc + log_lo * log_lc
++    n_comp = kept_idx - 1  # number of usable log returns
 +    # Use cumulative sums for O(1) per-window evaluation
 +    cs_oc = np.zeros(n_comp + 1, dtype=np.float64)
 +    cs_oc2 = np.zeros(n_comp + 1, dtype=np.float64)
@@ -903,8 +910,8 @@ index c472b2b..b2c3e70 100644
 +        sum_co2 = cs_co2[e] - cs_co2[s]
 +        sum_rs = cs_rs[e] - cs_rs[s]
 +
-+        var_o = (sum_oc2 - sum_oc ** 2 / cnt) / (cnt - 1.0)
-+        var_c = (sum_co2 - sum_co ** 2 / cnt) / (cnt - 1.0)
++        var_o = max((sum_oc2 - sum_oc ** 2 / cnt) / (cnt - 1.0), 0.0)
++        var_c = max((sum_co2 - sum_co ** 2 / cnt) / (cnt - 1.0), 0.0)
 +        rs = sum_rs / cnt
 +
 +        yz_var = max(float(var_o + k * var_c + (1.0 - k) * rs), 1e-10)
@@ -912,7 +919,7 @@ index c472b2b..b2c3e70 100644
 +
 +    return result
 diff --git a/src/quant/risk_measures.py b/src/quant/risk_measures.py
-index 4b83e80..8626808 100644
+index 4b83e80..75d0adb 100644
 --- a/src/quant/risk_measures.py
 +++ b/src/quant/risk_measures.py
 @@ -7,7 +7,7 @@ from dataclasses import dataclass
@@ -924,7 +931,7 @@ index 4b83e80..8626808 100644
  
  
  @dataclass(frozen=True)
-@@ -55,6 +55,112 @@ def contracts_for_tail_budget(net_ev: float, es_99: float, budget_usd: float) ->
+@@ -55,6 +55,146 @@ def contracts_for_tail_budget(net_ev: float, es_99: float, budget_usd: float) ->
      return int(np.floor(budget_usd / tail_loss_per_lot(es_99)))
  
  
@@ -938,17 +945,17 @@ index 4b83e80..8626808 100644
 +) -> tuple[float, float]:
 +    """14-day nonlinear portfolio Monte Carlo 99% VaR and Expected Shortfall (both ≥ 0).
 +
-+    Simulates correlated 1-factor (market) + idiosyncratic spot shocks per underlying
-+    over ``horizon_days`` (Student-:math:`t_5`, tail correlation 0.85 on market down-shocks)
-+    and leverage-correlated IV shocks.  Every option leg is repriced nonlinearly via
-+    Black-Scholes.  Linear legs (shares, futures) are revalued linearly.
++    Simulates correlated 1-factor (market) + idiosyncratic spot shocks per *underlying*
++    over ``horizon_days`` (Student-:math:`t_5`, tail correlation 0.85/0.40 on market
++    down/up moves) and leverage-correlated IV shocks.  Every option leg is repriced
++    nonlinearly via vectorised Black-Scholes.  Linear legs are revalued linearly.
 +
 +    Parameters
 +    ----------
 +    legs_spec : list[dict]
-+        Each dict must have keys ``is_option`` (bool), ``signed_qty`` (float),
-+        ``multiplier`` (float), ``spot`` (float), and optionally ``strike``, ``ttm``,
-+        ``q``, ``iv``, ``is_call`` for option legs.
++        Each dict must have keys ``underlying`` (str), ``is_option`` (bool),
++        ``signed_qty`` (float), ``multiplier`` (float), ``spot`` (float), and
++        optionally ``strike``, ``ttm``, ``q``, ``iv``, ``is_call``, ``theo_price``.
 +    horizon_days : float
 +        Risk horizon in calendar days.
 +    r : float
@@ -969,42 +976,80 @@ index 4b83e80..8626808 100644
 +
 +    rng = np.random.default_rng(seed)
 +
-+    # Identify unique underlying spots (group legs by spot for shock generation)
-+    spots = np.array([leg["spot"] for leg in legs_spec], dtype=np.float64)
++    # Group legs by underlying so both legs of a spread share the same spot path
++    underlying_keys: list[str] = []
++    group_indices: list[list[int]] = []
++    seen: dict[str, int] = {}
++    for i, leg in enumerate(legs_spec):
++        und = str(leg.get("underlying", ""))
++        idx = seen.get(und)
++        if idx is None:
++            idx = len(underlying_keys)
++            seen[und] = idx
++            underlying_keys.append(und)
++            group_indices.append([])
++        group_indices[idx].append(i)
++
++    n_und = len(underlying_keys)
 +    n_legs = len(legs_spec)
 +
-+    # Student-t 5 draws, scaled to unit variance sqrt((nu-2)/nu)
-+    z_market = rng.standard_t(df=5, size=n_scenarios) * np.sqrt(3.0 / 5.0)  # unit variance
-+    z_idio = rng.standard_t(df=5, size=(n_scenarios, n_legs)) * np.sqrt(3.0 / 5.0)
++    # Map each leg to its underlying group index
++    leg_to_und = np.zeros(n_legs, dtype=np.intp)
++    for und_idx, indices in enumerate(group_indices):
++        for i in indices:
++            leg_to_und[i] = und_idx
 +
-+    # Tail correlation: on market down-shocks (z_market < 0), mix 85% common + 15% idiosyncratic
-+    rho_tail = 0.85
-+    tail_mask = z_market < 0.0
-+    for i in range(n_legs):
-+        mix = np.where(tail_mask, rho_tail, 0.0)
-+        z_idio[:, i] = mix * z_market + np.sqrt(1.0 - mix ** 2) * z_idio[:, i]
-+
-+    # Effective shock per leg: 1-factor loading = 1.0 (all equities), plus idiosyncratic
-+    z_eff = z_market[:, np.newaxis] + z_idio
-+
-+    # Annualised vol for scaling (use a default 30% if iv not available)
-+    vols = np.array(
-+        [leg.get("iv", 0.30) if leg.get("is_option") else 0.30 for leg in legs_spec],
++    # Underlying-level arrays
++    und_spots = np.array(
++        [legs_spec[group_indices[i][0]]["spot"] for i in range(n_und)], dtype=np.float64
++    )
++    und_vols = np.array(
++        [
++            max(
++                legs_spec[group_indices[i][0]].get("iv", 0.30)
++                if legs_spec[group_indices[i][0]].get("is_option") else 0.30,
++                0.05,
++            )
++            for i in range(n_und)
++        ],
 +        dtype=np.float64,
 +    )
 +
++    # Student-t 5 draws, scaled to unit variance sqrt(5/3)
++    scale_t = np.sqrt(3.0 / 5.0)
++    z_market = rng.standard_t(df=5, size=n_scenarios) * scale_t
++    z_idio = rng.standard_t(df=5, size=(n_scenarios, n_und)) * scale_t
++
++    # Factor shock: rho=0.85 on down moves, 0.40 on up moves
++    rho = np.where(z_market < 0.0, 0.85, 0.40)
++    # z_eff = rho * z_market + sqrt(1 - rho^2) * z_idio  (unit variance)
++    z_eff = (
++        rho[:, np.newaxis] * z_market[:, np.newaxis]
++        + np.sqrt(1.0 - rho[:, np.newaxis] ** 2) * z_idio
++    )
++
 +    # Spot simulation: GBM drift
-+    drift = (r - 0.5 * vols ** 2) * dt_years
-+    vol_scale = vols * np.sqrt(dt_years)
-+    spot_sim = spots[np.newaxis, :] * np.exp(drift[np.newaxis, :] + vol_scale[np.newaxis, :] * z_eff)
++    drift = (r - 0.5 * und_vols ** 2) * dt_years
++    vol_scale = und_vols * np.sqrt(dt_years)
++    und_spot_sim = und_spots[np.newaxis, :] * np.exp(
++        drift[np.newaxis, :] + vol_scale[np.newaxis, :] * z_eff
++    )
 +
 +    # IV shock: leverage effect (β=0.7) + vol-of-vol
 +    beta_lev = 0.7
-+    vol_shock = -beta_lev * vol_scale[np.newaxis, :] * z_eff + 0.35 * vols[np.newaxis, :] * np.sqrt(dt_years) * rng.standard_normal(size=(n_scenarios, n_legs))
-+    vol_sim = np.maximum(vols[np.newaxis, :] + vol_shock, 0.05)
++    vol_shock = (
++        -beta_lev * vol_scale[np.newaxis, :] * z_eff
++        + 0.35 * und_vols[np.newaxis, :] * np.sqrt(dt_years)
++        * rng.standard_normal(size=(n_scenarios, n_und))
++    )
++    und_vol_sim = np.maximum(und_vols[np.newaxis, :] + vol_shock, 0.05)
 +
-+    # Reprice each leg
-+    from src.quant.black_scholes import bs_greeks
++    # Map underlying shocks to each leg
++    spot_sim = und_spot_sim[:, leg_to_und]
++    vol_sim = und_vol_sim[:, leg_to_und]
++
++    # Vectorised re-pricing
++    from src.quant.black_scholes import bsm_prices
 +
 +    pnl = np.zeros(n_scenarios, dtype=np.float64)
 +    for i, leg in enumerate(legs_spec):
@@ -1012,20 +1057,16 @@ index 4b83e80..8626808 100644
 +        mult = float(leg["multiplier"])
 +        if not leg.get("is_option", False):
 +            # Linear leg
-+            pnl += qty * mult * (spot_sim[:, i] - spots[i])
++            pnl += qty * mult * (spot_sim[:, i] - float(leg["spot"]))
 +        else:
-+            # Option leg: reprice via Black-Scholes
 +            strike = float(leg["strike"])
-+            ttm = max(float(leg.get("ttm", dt_years)) - dt_years, 1e-4)
++            rem_ttm = max(float(leg.get("ttm", dt_years)) - dt_years, 1e-4)
 +            is_call = bool(leg.get("is_call", True))
 +            q = float(leg.get("q", 0.0))
-+            theo_price = float(leg.get("theo_price", 0.0))
-+
-+            scenario_pnl = np.zeros(n_scenarios, dtype=np.float64)
-+            for j in range(n_scenarios):
-+                g = bs_greeks(spot_sim[j, i], strike, ttm, r, q, vol_sim[j, i], is_call)
-+                scenario_pnl[j] = g["price"] - theo_price
-+            pnl += qty * mult * scenario_pnl
++            theo = float(leg.get("theo_price", 0.0))
++            flag = "c" if is_call else "p"
++            new_prices = bsm_prices(spot_sim[:, i], strike, rem_ttm, r, vol_sim[:, i], flag, q)
++            pnl += qty * mult * (new_prices - theo)
 +
 +    # Compute VaR and ES from the P&L vector (loss = -pnl)
 +    loss = -pnl
@@ -1150,7 +1191,7 @@ index a73729f..a479107 100644
      max_parity_fut_diff_bps: float = 20.0    # Max forward divergence vs CME futures
      max_svi_rmse_vol_pts: float = 0.50       # Max SVI calibration RMSE before the surface is unusable
 diff --git a/src/services/portfolio.py b/src/services/portfolio.py
-index b88b5ef..4d06a16 100644
+index b88b5ef..e781ce6 100644
 --- a/src/services/portfolio.py
 +++ b/src/services/portfolio.py
 @@ -14,7 +14,7 @@ from src.common.log import LogLike
@@ -1162,7 +1203,35 @@ index b88b5ef..4d06a16 100644
  from src.services.portfolio_marks import (
      GREEK_KEYS,
      SPOT_SHOCKS_PCT,
-@@ -202,6 +202,7 @@ class PortfolioService:
+@@ -53,6 +53,7 @@ class InstrumentInfo:
+     kind: str                   # OPTION, OPTION_SPREAD or OTHER
+     multiplier: float
+     option: OptionSpec | None = None
++    spread_legs: tuple[tuple[str, int], ...] | None = None  # (instrument_id, ratio) pairs
+ 
+ 
+ class BookMarket(Protocol):
+@@ -132,7 +133,18 @@ class PortfolioService:
+         return None
+ 
+     def spread_option_legs(self, spread_id: str) -> list[tuple[InstrumentInfo, int]] | None:
+-        """Leg (instrument, ratio) pairs registered by the strategy under mft:spread_legs:<spread id>."""
++        """Leg (instrument, ratio) pairs: prefer info.spread_legs, fall back to mft:spread_legs:<id>."""
++        # First check InstrumentInfo for embedded legs (from OptionSpread.info["legs"])
++        info = self.market.instrument(spread_id)
++        if info is not None and info.spread_legs:
++            legs: list[tuple[InstrumentInfo, int]] = []
++            for iid, ratio in info.spread_legs:
++                leg_info = self.market.instrument(iid)
++                if leg_info is None or leg_info.kind != OPTION or leg_info.option is None:
++                    return None
++                legs.append((leg_info, ratio))
++            return legs or None
++        # Fall back to Valkey-stored spread legs
+         raw_legs = self.store.get_json_value(keys.spread_legs_key(spread_id))
+         if not isinstance(raw_legs, list):
+             return None
+@@ -202,6 +214,7 @@ class PortfolioService:
          session_realized_usd = closed_realized_usd + sum(float(p.realized_pnl) for p in positions)
          legs_spec: list[dict] = []
          position_rows: list[dict] = []
@@ -1170,7 +1239,7 @@ index b88b5ef..4d06a16 100644
  
          for pos in positions:
              iid = str(pos.instrument_id)
-@@ -246,6 +247,7 @@ class PortfolioService:
+@@ -246,6 +259,7 @@ class PortfolioService:
                  mark_px = live_mid if live_mid is not None else avg_px
                  mark_source = "UNMODELED_SPREAD"
                  pos_pnl = signed_qty * info.multiplier * (mark_px - avg_px)
@@ -1178,7 +1247,7 @@ index b88b5ef..4d06a16 100644
              else:
                  mult = info.multiplier if info is not None else 1.0
                  mark_px = self.live_mid(iid, now_ns)
-@@ -307,9 +309,17 @@ class PortfolioService:
+@@ -307,9 +321,17 @@ class PortfolioService:
          stress_grid = book_stress_grid(legs_spec, self.settings.risk_free_rate)
          worst_stress_usd = float(np.min(stress_grid))
  
@@ -1198,7 +1267,7 @@ index b88b5ef..4d06a16 100644
  
          # Sleeve equity is decoupled from IBKR NLV: allocated capital + this book's P&L
          sleeve = self.sleeve.snapshot(realized_pnl_usd, unrealized_pnl_usd, len(positions), now_ns)
-@@ -333,6 +343,10 @@ class PortfolioService:
+@@ -333,6 +355,10 @@ class PortfolioService:
              "risk": {
                  "book_var_99_usd": book_var_99_usd,
                  "book_es_99_usd": book_es_99_usd,
@@ -1209,11 +1278,36 @@ index b88b5ef..4d06a16 100644
                  "worst_7d_stress_usd": round(worst_stress_usd, 2),
                  "spot_shocks_pct": list(SPOT_SHOCKS_PCT),
                  "vol_shocks_pts": list(VOL_SHOCKS_PTS),
+diff --git a/src/services/portfolio_marks.py b/src/services/portfolio_marks.py
+index e2528c0..221cbb1 100644
+--- a/src/services/portfolio_marks.py
++++ b/src/services/portfolio_marks.py
+@@ -80,6 +80,7 @@ def option_exposure(
+             "charm_day": notional_qty * g["charm_day"],
+         },
+         "stress_leg": {
++            "underlying": str(option.underlying),
+             "is_option": True,
+             "signed_qty": qty,
+             "multiplier": multiplier,
+@@ -95,7 +96,7 @@ def option_exposure(
+ 
+ 
+ def linear_stress_leg(signed_qty: float, multiplier: float, price: float) -> dict[str, Any]:
+-    return {"is_option": False, "signed_qty": signed_qty, "multiplier": multiplier, "spot": price}
++    return {"underlying": "", "is_option": False, "signed_qty": signed_qty, "multiplier": multiplier, "spot": price}
+ 
+ 
+ def stress_leg_pnl(leg: Payload, spot_mult: float, vol_shift: float, dt_years: float, r: float) -> float:
 diff --git a/src/strategies/vrp_core.py b/src/strategies/vrp_core.py
-index a15853f..8b9e8cc 100644
+index a15853f..722a147 100644
 --- a/src/strategies/vrp_core.py
 +++ b/src/strategies/vrp_core.py
-@@ -25,7 +25,7 @@ DEFAULT_TOB_SIZE = 10
+@@ -21,11 +21,10 @@ from src.scanner.verticals import VerticalPair, adjacent_verticals, split_by_rig
+ ENTRY = "ENTRY"
+ EXIT = "EXIT"
+ STRATEGY_MIN_CREDIT = 0.05
+-DEFAULT_TOB_SIZE = 10
  POSITION_TOLERANCE = 1e-6
  
  Trade = dict[str, Any]
@@ -1222,17 +1316,22 @@ index a15853f..8b9e8cc 100644
  
  
  # --- Spread book -----------------------------------------------------------------------------------
-@@ -240,7 +240,8 @@ def enrich_surface_legs(
+@@ -240,7 +239,13 @@ def enrich_surface_legs(
              continue
          bid = float(raw.get("bid") or 0.0)
          ask = float(raw.get("ask") or 0.0)
 -        bid_size = ask_size = DEFAULT_TOB_SIZE
-+        bid_size: int | None = None
-+        ask_size: int | None = None
++        # Read surface snapshot bid_size/ask_size if present, otherwise None
++        bid_size: int | None = raw.get("bid_size")
++        if bid_size is not None:
++            bid_size = int(bid_size)
++        ask_size: int | None = raw.get("ask_size")
++        if ask_size is not None:
++            ask_size = int(ask_size)
  
          own = strategy_quote(instrument_id)
          if own is not None:
-@@ -251,8 +252,8 @@ def enrich_surface_legs(
+@@ -251,8 +256,8 @@ def enrich_surface_legs(
              cached = cache_quote(instrument_id)
              if cached is not None and cached.mid is not None:
                  bid, ask = cached.bid, cached.ask
@@ -1244,7 +1343,7 @@ index a15853f..8b9e8cc 100644
          mid = two_sided_mid(bid, ask)
          if mid is None:
 diff --git a/src/strategies/vrp_engine.py b/src/strategies/vrp_engine.py
-index 1dad26a..ae21fea 100644
+index 1dad26a..6884e71 100644
 --- a/src/strategies/vrp_engine.py
 +++ b/src/strategies/vrp_engine.py
 @@ -7,6 +7,7 @@ from __future__ import annotations
@@ -1255,7 +1354,7 @@ index 1dad26a..ae21fea 100644
  import time
  from collections.abc import Callable
  from dataclasses import dataclass, field, replace
-@@ -14,12 +15,13 @@ from datetime import date
+@@ -14,12 +15,14 @@ from datetime import date
  from typing import Any, Protocol
  
  from src.common import keys
@@ -1263,6 +1362,7 @@ index 1dad26a..ae21fea 100644
 +from src.common.constants import DEFAULT_VALKEY_URL, SECS_PER_DAY
  from src.common.log import LogLike
  from src.common.market import OptionSpec, QuoteObs, symbol_of
++from src.common.numeric import is_number
  from src.common.quotes import combo_mid_natural
  from src.common.store import JsonStore
  from src.execution.passive_combo import CREDIT_OPEN, DEBIT_CLOSE, ChildClipOrder, PassiveComboExecutor
@@ -1270,7 +1370,7 @@ index 1dad26a..ae21fea 100644
  from src.strategies.vrp_core import (
      ENTRY,
      EXIT,
-@@ -159,7 +161,7 @@ class VrpEngine:
+@@ -159,7 +162,7 @@ class VrpEngine:
          self.clock_ns = clock_ns
          self.monotonic = monotonic
  
@@ -1279,7 +1379,7 @@ index 1dad26a..ae21fea 100644
          self.spot_mid: float = 0.0
          self.book = SpreadBook()
          self.working: dict[str, WorkingOrder] = {}
-@@ -168,6 +170,7 @@ class VrpEngine:
+@@ -168,6 +171,7 @@ class VrpEngine:
          self._last_fill_wall_ns: int = 0
          self._risk_check_mono: float = float("-inf")
          self._risk_block_reason: str | None = None
@@ -1287,7 +1387,7 @@ index 1dad26a..ae21fea 100644
  
      # --- Lifecycle -------------------------------------------------------------------------------
  
-@@ -208,8 +211,8 @@ class VrpEngine:
+@@ -208,8 +212,8 @@ class VrpEngine:
              self.quotes[quote.instrument_id] = (
                  quote.bid,
                  quote.ask,
@@ -1298,7 +1398,7 @@ index 1dad26a..ae21fea 100644
              )
  
      def leg_quote(self, instrument_id: str) -> tuple[float, float] | None:
-@@ -481,6 +484,8 @@ class VrpEngine:
+@@ -481,6 +485,8 @@ class VrpEngine:
          return candidate_row(cand, risk, decision, dte, per_lot_es99, per_lot_ev), cand, decision
  
      def current_entry_block_reason(self) -> str | None:
@@ -1307,7 +1407,7 @@ index 1dad26a..ae21fea 100644
          portfolio_ts_ns = 0
          if self._last_fill_wall_ns:
              portfolio_ts_ns = int(self.store.get_json(keys.PORTFOLIO_RISK).get("ts_ns") or 0)
-@@ -549,17 +554,35 @@ class VrpEngine:
+@@ -549,17 +555,35 @@ class VrpEngine:
          underlying = str(s.underlying_id)
          surf = self.store.get_json(keys.surface_key(underlying))
          rv_snap = self.store.get_json(keys.rv_key(underlying))
@@ -1318,7 +1418,7 @@ index 1dad26a..ae21fea 100644
 +        # Validate RV freshness and finiteness — fail closed
 +        if snapshot_is_fresh(rv_snap, wall_ns, SECS_PER_DAY):
 +            raw_rv = rv_snap.get("rv_20d") if isinstance(rv_snap, dict) else None
-+            if isinstance(raw_rv, (int, float)) and math.isfinite(float(raw_rv)) and float(raw_rv) > 0.0:
++            if is_number(raw_rv) and math.isfinite(float(raw_rv)) and float(raw_rv) > 0.0:
 +                rv_20d = float(raw_rv)
 +            else:
 +                self._rv_block_reason = "RV_MISSING_OR_INVALID"
@@ -1349,7 +1449,7 @@ index 1dad26a..ae21fea 100644
  
          block_reason = self.current_entry_block_reason()
          outcome = self._enter(best, spot, block_reason)
-@@ -570,7 +593,7 @@ class VrpEngine:
+@@ -570,7 +594,7 @@ class VrpEngine:
              "entry_block_reason": block_reason,
              "underlying": underlying,
              "spot": round(spot, 2),
@@ -1359,7 +1459,7 @@ index 1dad26a..ae21fea 100644
              "top_candidate": top_row,
              "all_candidates": rows[:MAX_CANDIDATE_ROWS],
 diff --git a/tests/quant/test_realized_vol.py b/tests/quant/test_realized_vol.py
-index 3453318..8b54e79 100644
+index 3453318..096bca9 100644
 --- a/tests/quant/test_realized_vol.py
 +++ b/tests/quant/test_realized_vol.py
 @@ -1,4 +1,6 @@
@@ -1377,7 +1477,7 @@ index 3453318..8b54e79 100644
      trailing_rolling_rv,
      yang_zhang_rv,
  )
-@@ -56,9 +59,89 @@ def test_realized_vol_guards_invalid_ohlc_and_windows():
+@@ -56,9 +59,107 @@ def test_realized_vol_guards_invalid_ohlc_and_windows():
      assert bipower_jump_ratio(invalid, 20) == 0.0
  
  
@@ -1399,7 +1499,7 @@ index 3453318..8b54e79 100644
 +
 +
 +def test_sanitize_ohlc_quarantines_bad_ohlc():
-+    """Bar with high < close or a 10x bad print is quarantined (no 758% RV spike)."""
++    """Bar with high < close or a 10x bad print is quarantined; next valid bar is NOT dropped."""
 +    df = daily_ohlc_frame(n=80, seed=11, daily_vol=0.01)
 +    # Insert a corrupt spike: high < close (intraday violation)
 +    bad_high = df.copy()
@@ -1408,12 +1508,30 @@ index 3453318..8b54e79 100644
 +    assert len(cleaned) == len(bad_high) - 1  # Exactly one row dropped
 +    assert yang_zhang_rv(cleaned, 20) == pytest.approx(yang_zhang_rv(df, 20), rel=0.5)
 +
-+    # Insert a 10x close spike
++    # Insert a 10x close spike (valid O=H=L=C=10x) - only the spike row is dropped
 +    bad_spike = df.copy()
-+    bad_spike.loc[50, "close"] = bad_spike.loc[49, "close"] * 10.0
++    ten_x = bad_spike.loc[49, "close"] * 10.0
++    bad_spike.loc[50, ["open", "high", "low", "close"]] = ten_x  # Valid OHLC but 10x price
 +    cleaned2 = sanitize_ohlc(bad_spike)
-+    assert len(cleaned2) == len(bad_spike) - 1  # Spike row dropped
++    assert len(cleaned2) == len(bad_spike) - 1  # Spike row dropped, next row kept
 +    assert yang_zhang_rv(cleaned2, 20) > 0.0 and yang_zhang_rv(cleaned2, 20) < 0.5  # No 758% RV
++    # Verify the row after the spike is still present (sequential check)
++    assert bad_spike.loc[51, "close"] in cleaned2["close"].values
++
++
++def test_trailing_rolling_rv_with_datetimeindex():
++    """trailing_rolling_rv works with a DatetimeIndex (not just RangeIndex)."""
++    df = daily_ohlc_frame(n=80, seed=13)
++    df.index = pd.date_range("2026-01-01", periods=len(df), freq="D")
++    result = trailing_rolling_rv(df, window=20, ann=252)
++    assert len(result) > 0
++    assert all(np.isfinite(result))
++    # Verify equivalence to the scalar version
++    scalar = np.array(
++        [yang_zhang_rv(df.iloc[:end], 20, 252) for end in range(21, len(df) + 1)],
++        dtype=np.float64,
++    )
++    np.testing.assert_allclose(result, scalar, atol=1e-10)
 +
 +
  # --- Bipower jump share ---------------------------------------------------------------------------
@@ -1605,7 +1723,7 @@ index 3fbbc2d..dc1b3a2 100644
 +    check = es_budget_check(400.0, float("nan"), 5, CFG)
 +    assert (check.capped_qty, check.reasons) == (0, ["INVALID_INCREMENTAL_ES99"])
 diff --git a/tests/services/test_portfolio_service.py b/tests/services/test_portfolio_service.py
-index 4829d65..e3535a5 100644
+index 4829d65..bca9375 100644
 --- a/tests/services/test_portfolio_service.py
 +++ b/tests/services/test_portfolio_service.py
 @@ -85,7 +85,8 @@ def test_share_position_marks_live_and_stresses_linearly(make_service):
@@ -1618,11 +1736,10 @@ index 4829d65..e3535a5 100644
      assert (payload["sleeve"]["equity"], payload["sleeve"]["high_water_mark"]) == (101_000.0, 101_000.0)
  
  
-@@ -183,7 +184,34 @@ def test_attribution_runs_across_evaluations(make_service, store, market):
+@@ -183,7 +184,65 @@ def test_attribution_runs_across_evaluations(make_service, store, market):
      assert attribution["since_ts_ns"] == NOW_NS
  
  
--def test_surfaces_are_keyed_by_symbol(make_service, store):
 +def test_unmodeled_spread_sets_flag(make_service, store, market):
 +    """An OPTION_SPREAD with no info['legs'] sets has_unmodeled_positions=True."""
 +    store.set_json(keys.spread_legs_key("UNKNOWN_SPREAD"), "not valid")  # No usable legs
@@ -1651,9 +1768,40 @@ index 4829d65..e3535a5 100644
 +    # The 14d MC ES99 should be larger than the 1d linear ES99 (longer horizon + non-normal tails)
 +    assert risk["book_es_99_usd"] > 0.0
 +    assert risk["book_1d_linear_es_99_usd"] > 0.0
++
++
+ def test_surfaces_are_keyed_by_symbol(make_service, store):
      store.set_json(keys.surface_key("QQQ.NASDAQ"), surface_payload("QQQ.NASDAQ"))
      store.set_text(keys.surface_key("BAD.ARCA"), "not json")
      assert sorted(make_service().surfaces_by_symbol()) == ["QQQ", "SPY"]
++
++
++def test_defined_risk_credit_spread_es99_is_bounded(make_service, store, market):
++    """A 1-lot $5-wide credit spread (e.g. 690/685 put) has book_es_99_usd inside [0, 500]."""
++    store.set_json(keys.spread_legs_key(SPREAD),
++                   [{"instrument_id": P690, "ratio": 1}, {"instrument_id": P685, "ratio": -1}])
++    payload = make_service().evaluate([PositionView(SPREAD, -1.0, 0.6)], 0.0, NOW_NS)
++    es = payload["risk"]["book_es_99_usd"]
++    # A bull put spread's max loss is width * 100 = $500. 14d MC ES should be positive but under that.
++    assert 0.0 < es <= 500.0, f"ES99 ${es:.2f} outside expected (0, 500] range"
++    assert payload["risk"]["book_var_99_usd"] > 0.0
++
++
++def test_beta_hedged_short_gamma_produces_tail_risk(make_service, store, market):
++    """A delta-hedged short strangle (beta_delta_shares ≈ 0) still has positive book_es_99_usd (gamma + idio)."""
++    store.set_json(keys.spread_legs_key(SPREAD),
++                   [{"instrument_id": P690, "ratio": 1}, {"instrument_id": P685, "ratio": -1}])
++    market.instruments["SPY.ARCA"] = InstrumentInfo(OTHER, 1.0)
++    # Short 2-lot put spread (bearish delta ≈ -2 * ~0.20 = -0.4) + long SPY shares to offset delta
++    payload = make_service().evaluate([
++        PositionView(SPREAD, -2.0, 0.6),
++        PositionView("SPY.ARCA", 40.0, 700.0),
++    ], 0.0, NOW_NS)
++    # Beta-hedged: beta_delta ≈ net delta * (spot / bench_spot) should be near zero
++    beta_delta = payload["greeks"]["beta_delta_shares"]
++    assert abs(beta_delta) < 200.0, f"Beta-delta {beta_delta:.1f} not near zero"
++    # Short gamma still generates tail risk
++    assert payload["risk"]["book_es_99_usd"] > 0.0, "Hedged position produces no tail risk"
 diff --git a/tests/strategies/test_vrp_core.py b/tests/strategies/test_vrp_core.py
 index 307a841..f31db64 100644
 --- a/tests/strategies/test_vrp_core.py

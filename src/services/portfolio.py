@@ -275,7 +275,7 @@ class PortfolioService:
                 pos_greeks["beta_delta"] = (
                     signed_qty * mult * mark_px / bench_spot if bench_spot > 0 else signed_qty * mult
                 )
-                legs_spec.append(linear_stress_leg(signed_qty, mult, mark_px))
+                legs_spec.append(linear_stress_leg(signed_qty, mult, mark_px, underlying=iid))
 
             unrealized_pnl_usd += pos_pnl
             for key in GREEK_KEYS:
