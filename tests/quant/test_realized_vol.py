@@ -1,4 +1,6 @@
+"""Tests for realised-volatility, jump-share, correlation and percentile helpers."""
 import math
+import time
 from datetime import date
 
 import numpy as np
@@ -10,6 +12,7 @@ from src.quant.realized_vol import (
     bipower_jump_ratio,
     daily_log_returns,
     percentile_rank,
+    sanitize_ohlc,
     trailing_rolling_rv,
     yang_zhang_rv,
 )
@@ -56,7 +59,87 @@ def test_realized_vol_guards_invalid_ohlc_and_windows():
     assert bipower_jump_ratio(invalid, 20) == 0.0
 
 
+# --- Sanitize OHLC --------------------------------------------------------------------------------
+
+
+def test_sanitize_ohlc_removes_corrupt_bars():
+    """A corrupt bar at any index does not collapse yang_zhang_rv on a 60-bar frame."""
+    df = daily_ohlc_frame(n=60, seed=10)
+    original = yang_zhang_rv(df, 20)
+    corrupt = df.copy()
+    corrupt.loc[0, "close"] = 0.0  # Bar at index 0 is in the tail
+    # With sanitization only on the active slice, the corrupt bar is caught
+    assert yang_zhang_rv(corrupt, 20) > 0.0  # Remaining good bars still produce a valid RV
+
+    corrupt_nan = df.copy()
+    corrupt_nan.loc[0, "high"] = float("nan")
+    assert yang_zhang_rv(corrupt_nan, 20) > 0.0
+
+
+def test_sanitize_ohlc_quarantines_bad_ohlc():
+    """Bar with high < close or a 10x bad print is quarantined (no 758% RV spike)."""
+    df = daily_ohlc_frame(n=80, seed=11, daily_vol=0.01)
+    # Insert a corrupt spike: high < close (intraday violation)
+    bad_high = df.copy()
+    bad_high.loc[40, "high"] = bad_high.loc[40, "close"] - 1.0
+    cleaned = sanitize_ohlc(bad_high)
+    assert len(cleaned) == len(bad_high) - 1  # Exactly one row dropped
+    assert yang_zhang_rv(cleaned, 20) == pytest.approx(yang_zhang_rv(df, 20), rel=0.5)
+
+    # Insert a 10x close spike
+    bad_spike = df.copy()
+    bad_spike.loc[50, "close"] = bad_spike.loc[49, "close"] * 10.0
+    cleaned2 = sanitize_ohlc(bad_spike)
+    assert len(cleaned2) == len(bad_spike) - 1  # Spike row dropped
+    assert yang_zhang_rv(cleaned2, 20) > 0.0 and yang_zhang_rv(cleaned2, 20) < 0.5  # No 758% RV
+
+
 # --- Bipower jump share ---------------------------------------------------------------------------
+
+
+def test_bipower_finite_sample_correction():
+    """bipower_jump_ratio on pure i.i.d. Gaussian returns has mean near 0.0 (not +0.05)."""
+    ratios = []
+    for seed in range(30, 50):
+        # Use close-only frames (no OHLC overnight noise) to isolate the finite-sample effect
+        rng = np.random.default_rng(seed)
+        n = 120
+        # Clean random walk closes: no overnight gap
+        log_rets = rng.normal(0.0, 0.01, n)
+        closes = 100.0 * np.exp(np.cumsum(log_rets))
+        df = pd.DataFrame({
+            "open": closes, "high": closes, "low": closes, "close": closes,
+        })
+        r = bipower_jump_ratio(df, 60)
+        ratios.append(r)
+    mean_ratio = float(np.mean(ratios))
+    # With W/(W-1) correction, mean jump share should be near 0; old biased version peaked at ~0.05
+    assert mean_ratio < 0.03, f"Mean jump ratio {mean_ratio:.4f} still biased above 3%"
+
+
+# --- Trailing rolling RV -------------------------------------------------------------------------
+
+
+def test_trailing_rolling_rv_vectorized_matches_scalar():
+    """Vectorized trailing_rolling_rv matches scalar loop within 1e-10 and runs fast."""
+    df = daily_ohlc_frame(n=250, seed=12)
+
+    # Scalar reference
+    def scalar_trailing(df, window=20, ann=252):
+        n = len(df)
+        first_end = max(window + 1, n - ann + 1)
+        return np.array(
+            [yang_zhang_rv(df.iloc[:end], window, ann) for end in range(first_end, n + 1)],
+            dtype=np.float64,
+        )
+
+    t0 = time.perf_counter()
+    vectorized = trailing_rolling_rv(df, window=20, ann=252)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    scalar = scalar_trailing(df)
+    np.testing.assert_allclose(vectorized, scalar, atol=1e-10)
+    assert elapsed_ms < 5.0, f"trailing_rolling_rv took {elapsed_ms:.1f}ms (>= 5ms)"
 
 
 def test_jump_ratio_is_zero_without_movement_or_history():

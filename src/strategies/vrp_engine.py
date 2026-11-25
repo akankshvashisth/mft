@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -14,12 +15,13 @@ from datetime import date
 from typing import Any, Protocol
 
 from src.common import keys
-from src.common.constants import DEFAULT_VALKEY_URL
+from src.common.constants import DEFAULT_VALKEY_URL, SECS_PER_DAY
 from src.common.log import LogLike
 from src.common.market import OptionSpec, QuoteObs, symbol_of
 from src.common.quotes import combo_mid_natural
 from src.common.store import JsonStore
 from src.execution.passive_combo import CREDIT_OPEN, DEBIT_CLOSE, ChildClipOrder, PassiveComboExecutor
+from src.risk.gate_rules import snapshot_is_fresh
 from src.strategies.vrp_core import (
     ENTRY,
     EXIT,
@@ -168,6 +170,7 @@ class VrpEngine:
         self._last_fill_wall_ns: int = 0
         self._risk_check_mono: float = float("-inf")
         self._risk_block_reason: str | None = None
+        self._rv_block_reason: str | None = None
 
     # --- Lifecycle -------------------------------------------------------------------------------
 
@@ -481,6 +484,8 @@ class VrpEngine:
         return candidate_row(cand, risk, decision, dte, per_lot_es99, per_lot_ev), cand, decision
 
     def current_entry_block_reason(self) -> str | None:
+        if self._rv_block_reason is not None:
+            return self._rv_block_reason
         portfolio_ts_ns = 0
         if self._last_fill_wall_ns:
             portfolio_ts_ns = int(self.store.get_json(keys.PORTFOLIO_RISK).get("ts_ns") or 0)
@@ -549,17 +554,35 @@ class VrpEngine:
         underlying = str(s.underlying_id)
         surf = self.store.get_json(keys.surface_key(underlying))
         rv_snap = self.store.get_json(keys.rv_key(underlying))
-        rv_20d = float(rv_snap.get("rv_20d") or 0.25)
+        rv_20d: float | None = None
+        self._rv_block_reason = None
+
+        # Validate RV freshness and finiteness — fail closed
+        if snapshot_is_fresh(rv_snap, wall_ns, SECS_PER_DAY):
+            raw_rv = rv_snap.get("rv_20d") if isinstance(rv_snap, dict) else None
+            if isinstance(raw_rv, (int, float)) and math.isfinite(float(raw_rv)) and float(raw_rv) > 0.0:
+                rv_20d = float(raw_rv)
+            else:
+                self._rv_block_reason = "RV_MISSING_OR_INVALID"
+        else:
+            self._rv_block_reason = "RV_MISSING_OR_INVALID"
+
         spot = self.spot_mid or float(surf.get("spot") or 0.0)
 
         self.manage_working_orders()
         exit_signals = self.evaluate_exits(today)
 
-        evaluated = [self.evaluate_candidate(cand, rv_20d, spot, today) for cand in self.candidates(surf, today)]
-        evaluated.sort(key=lambda e: rank_key(e[0]), reverse=True)
-        rows = [e[0] for e in evaluated]
-        top_row = rows[0] if rows else None
-        best = evaluated[0] if evaluated and evaluated[0][0]["gate_approved"] else None
+        if rv_20d is not None:
+            evaluated = [self.evaluate_candidate(cand, rv_20d, spot, today) for cand in self.candidates(surf, today)]
+            evaluated.sort(key=lambda e: rank_key(e[0]), reverse=True)
+            rows = [e[0] for e in evaluated]
+            top_row = rows[0] if rows else None
+            best = evaluated[0] if evaluated and evaluated[0][0]["gate_approved"] else None
+        else:
+            evaluated = []
+            rows = []
+            top_row = None
+            best = None
 
         block_reason = self.current_entry_block_reason()
         outcome = self._enter(best, spot, block_reason)
@@ -570,7 +593,7 @@ class VrpEngine:
             "entry_block_reason": block_reason,
             "underlying": underlying,
             "spot": round(spot, 2),
-            "rv_20d": round(rv_20d, 4),
+            "rv_20d": round(rv_20d, 4) if rv_20d is not None else None,
             "candidates_scanned": len(rows),
             "top_candidate": top_row,
             "all_candidates": rows[:MAX_CANDIDATE_ROWS],

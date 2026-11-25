@@ -1,0 +1,2300 @@
+
+================================================================================
+FILE: src/strategies/vrp_engine.py
+================================================================================
+"""Nautilus-free VRP income engine: candidates -> pricer -> gate -> ranking -> one passive clip, plus exits.
+
+Venue access goes through two small protocols (OrderGateway, MarketView) so the engine can be driven by
+fakes in tests and by the Nautilus adapters (src.adapters.order_gateway) in production.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
+from datetime import date
+from typing import Any, Protocol
+
+from src.common import keys
+from src.common.constants import DEFAULT_VALKEY_URL
+from src.common.log import LogLike
+from src.common.market import OptionSpec, QuoteObs, symbol_of
+from src.common.quotes import combo_mid_natural
+from src.common.store import JsonStore
+from src.execution.passive_combo import CREDIT_OPEN, DEBIT_CLOSE, ChildClipOrder, PassiveComboExecutor
+from src.strategies.vrp_core import (
+    ENTRY,
+    EXIT,
+    SpreadBook,
+    apply_dte_window,
+    build_candidates,
+    candidate_row,
+    clip_preview_rows,
+    entry_block_reason,
+    exit_confirmed,
+    exit_reason,
+    exit_signal,
+    leg_mismatches,
+    per_lot_risk,
+    rank_key,
+)
+
+HISTORY_MAX_LEN = 200
+RISK_CHECK_INTERVAL_SECS = 1.0
+MAX_CANDIDATE_ROWS = 8
+
+
+@dataclass(frozen=True)
+class VrpSettings:
+    underlying_id: str
+    option_ids: tuple[str, ...] = ()
+    paper_routing_enabled: bool = False
+    eval_interval_secs: int = 15
+    sleeve_equity_usd: float = 100_000.0
+    profit_target_fraction: float = 0.50
+    min_exit_dte: int = 14
+    valkey_url: str = DEFAULT_VALKEY_URL
+
+    @property
+    def symbol(self) -> str:
+        return symbol_of(self.underlying_id)
+
+    @property
+    def mode(self) -> str:
+        return "LIVE_PAPER_ROUTING" if self.paper_routing_enabled else "SHADOW_DRY_RUN"
+
+
+@dataclass(frozen=True)
+class OrderView:
+    is_open: bool
+    is_closed: bool
+    is_pending_update: bool = False
+    is_pending_cancel: bool = False
+    status: str = ""
+
+
+@dataclass(frozen=True)
+class PreparedOrder:
+    order_key: str      # Client order id
+    spread_id: str      # Spread instrument id
+    handle: Any = None  # Gateway-specific order object
+
+
+class OrderGateway(Protocol):
+    def prepare(self, legs: list[dict], side: str, lots: int, limit_price: float) -> PreparedOrder:
+        """Builds (or reuses) the spread instrument and a DAY limit order for it; nothing is sent yet."""
+        ...
+
+    def submit(self, order: PreparedOrder) -> None: ...
+
+    def modify_price(self, order_key: str, price: float) -> bool:
+        """False when the order can't be repriced (e.g. its instrument is unknown)."""
+        ...
+
+    def cancel(self, order_key: str) -> None: ...
+
+    def order_view(self, order_key: str) -> OrderView | None: ...
+
+
+class MarketView(Protocol):
+    def cache_quote(self, instrument_id: str) -> QuoteObs | None: ...
+
+    def option_spec(self, instrument_id: str) -> OptionSpec | None: ...
+
+    def net_position_qty(self, instrument_id: str) -> float: ...
+
+    def ensure_subscribed(self, instrument_id: str) -> None:
+        """Subscribes to an option's quotes once, if the instrument is known."""
+        ...
+
+
+@dataclass
+class WorkingOrder:
+    """One in-flight passive child clip (an OptionSpread DAY limit order)."""
+
+    order_key: str
+    clip_id: str
+    parent_id: str
+    purpose: str            # ENTRY or EXIT
+    side: str               # CREDIT_OPEN or DEBIT_CLOSE
+    spread_key: str
+    legs: list[dict]
+    combo: Any
+    expiry: str
+    filled_lots: float = 0.0
+    fill_notional: float = 0.0
+    commission_usd: float = 0.0
+
+
+@dataclass
+class EntryOutcome:
+    action: str = "STAND_DOWN"
+    clips_planned: list[dict] = field(default_factory=list)
+    routed_order_ids: list[str] = field(default_factory=list)
+
+
+class VrpEngine:
+    """At most one child clip works at a time, and every further clip needs a fresh gate approval."""
+
+    def __init__(
+        self,
+        settings: VrpSettings,
+        *,
+        gate: Any,
+        pricer: Any,
+        executor: PassiveComboExecutor,
+        store: JsonStore,
+        gateway: OrderGateway,
+        market: MarketView,
+        log: LogLike | None = None,
+        clock_ns: Callable[[], int] = time.time_ns,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.settings = settings
+        self.gate = gate
+        self.pricer = pricer
+        self.executor = executor
+        self.store = store
+        self.gateway = gateway
+        self.market = market
+        self.log = log if log is not None else logging.getLogger(__name__)
+        self.clock_ns = clock_ns
+        self.monotonic = monotonic
+
+        self.quotes: dict[str, tuple[float, float, int, int]] = {}
+        self.spot_mid: float = 0.0
+        self.book = SpreadBook()
+        self.working: dict[str, WorkingOrder] = {}
+        self.book_key = keys.vrp_book_key(settings.underlying_id)
+        self._registered_spreads: set[str] = set()
+        self._last_fill_wall_ns: int = 0
+        self._risk_check_mono: float = float("-inf")
+        self._risk_block_reason: str | None = None
+
+    # --- Lifecycle -------------------------------------------------------------------------------
+
+    def start(self) -> int:
+        """Subscribes to the configured options, restores the persisted book; returns open spreads."""
+        for option_id in self.settings.option_ids:
+            self.market.ensure_subscribed(str(option_id))
+        self.book = SpreadBook.from_json(self.store.get_json(self.book_key))
+        for trade in self.book.trades.values():
+            self._ensure_leg_subscriptions(trade["legs"])
+        return len(self.book)
+
+    def stop(self) -> None:
+        """Nothing keeps working unattended after shutdown (DAY orders would otherwise live until the close)."""
+        for key in list(self.working):
+            view = self.gateway.order_view(key)
+            if view is not None and view.is_open and not view.is_pending_cancel:
+                self.gateway.cancel(key)
+        self.persist_book()
+
+    def persist_book(self) -> None:
+        self.store.set_json(self.book_key, self.book.to_json())
+
+    def _ensure_leg_subscriptions(self, legs: list[dict]) -> None:
+        for leg in legs:
+            self.market.ensure_subscribed(str(leg["instrument_id"]))
+
+    # --- Market data -----------------------------------------------------------------------------
+
+    def on_quote(self, quote: QuoteObs) -> None:
+        if quote.mid is None:
+            return
+        if quote.instrument_id == str(self.settings.underlying_id):
+            self.spot_mid = quote.mid
+            # Adverse-move cancels and dwell-timer limit steps react to every underlying tick
+            self.manage_working_orders()
+        else:
+            self.quotes[quote.instrument_id] = (
+                quote.bid,
+                quote.ask,
+                int(quote.bid_size or 10),
+                int(quote.ask_size or 10),
+            )
+
+    def leg_quote(self, instrument_id: str) -> tuple[float, float] | None:
+        own = self.quotes.get(instrument_id)
+        if own is not None:
+            return own[0], own[1]
+        cached = self.market.cache_quote(instrument_id)
+        if cached is None or cached.mid is None:
+            return None
+        return cached.bid, cached.ask
+
+    def combo_prices(self, legs: list[dict], side: str) -> tuple[float, float] | None:
+        """(mid, natural) in the spread's own convention: sum(ratio x leg price), positive for credit spreads."""
+        return combo_mid_natural(legs, self.leg_quote, selling=(side == CREDIT_OPEN))
+
+    # --- Order lifecycle -------------------------------------------------------------------------
+
+    def on_fill(self, order_key: str, last_qty: float, last_px: float, commission: float | None = None) -> None:
+        wo = self.working.get(order_key)
+        if wo is None:
+            return
+        lots = float(last_qty)
+        px = float(last_px)
+        wo.filled_lots += lots
+        wo.fill_notional += px * lots
+        if commission is not None:
+            wo.commission_usd += abs(float(commission))
+
+        if wo.purpose == ENTRY:
+            self.book.apply_entry_fill(wo.spread_key, wo.combo, wo.legs, wo.expiry, px, lots, self.clock_ns())
+        else:
+            self.book.apply_exit_fill(wo.spread_key, lots)
+        self._last_fill_wall_ns = self.clock_ns()
+        self.persist_book()
+
+        view = self.gateway.order_view(order_key)
+        if view is None or view.is_closed:
+            self.finalize(order_key, "FILLED")
+
+    def on_terminal(self, order_key: str, status: str, reason: str = "") -> None:
+        """Cancelled, expired, rejected or denied: the clip stops working."""
+        if status in ("REJECTED", "DENIED") and order_key in self.working:
+            self.log.warning(f"OptionSpread order {status.lower()} {order_key}: {reason}")
+        self.finalize(order_key, status)
+
+    def on_modify_rejected(self, order_key: str) -> None:
+        wo = self.working.get(order_key)
+        view = self.gateway.order_view(order_key)
+        if wo is None or view is None or not view.is_open or view.is_pending_cancel:
+            return
+        # The executor already stepped its limit; cancel rather than work a price it no longer tracks
+        self.executor.mark_clip_status(wo.clip_id, "CANCELLED_MODIFY_REJECTED")
+        self.gateway.cancel(order_key)
+
+    def finalize(self, order_key: str, status: str) -> None:
+        wo = self.working.pop(order_key, None)
+        if wo is None:
+            return
+        if wo.filled_lots > 0.0:
+            self.executor.record_fill(
+                wo.clip_id,
+                wo.fill_notional / wo.filled_lots,
+                wo.commission_usd,
+                filled_lots=int(round(wo.filled_lots)),
+            )
+        else:
+            self.executor.mark_clip_status(wo.clip_id, status)
+        self.executor.discard_clip(wo.clip_id)
+
+    def _register_spread_legs(self, spread_id: str, legs: list[dict]) -> None:
+        if spread_id in self._registered_spreads:
+            return
+        # Lets PortfolioAnalyticsActor decompose spread-level positions into option legs
+        self.store.set_json(
+            keys.spread_legs_key(spread_id),
+            [{"instrument_id": str(leg["instrument_id"]), "ratio": int(leg["ratio"])} for leg in legs],
+        )
+        self._registered_spreads.add(spread_id)
+
+    def route_clip(self, clip: ChildClipOrder, purpose: str, legs: list[dict], combo: Any, expiry: str) -> str | None:
+        """Submits one passive child clip as an atomic OptionSpread LIMIT order (DAY)."""
+        order_key: str | None = None
+        try:
+            prepared = self.gateway.prepare(legs, clip.side, clip.lots, clip.current_limit_price)
+            order_key = prepared.order_key
+            self._register_spread_legs(prepared.spread_id, legs)
+            # Registered before submission: denials (and simulated fills) can arrive synchronously
+            self.working[order_key] = WorkingOrder(
+                order_key=order_key,
+                clip_id=clip.clip_id,
+                parent_id=clip.parent_order_id,
+                purpose=purpose,
+                side=clip.side,
+                spread_key=prepared.spread_id,
+                legs=legs,
+                combo=combo,
+                expiry=expiry,
+            )
+            self.gateway.submit(prepared)
+        except Exception as exc:
+            self.log.error(f"Failed to submit {purpose} OptionSpread order ({clip.combo_label}): {exc}")
+            if order_key is not None:
+                self.working.pop(order_key, None)
+            self.executor.mark_clip_status(clip.clip_id, "SUBMIT_FAILED")
+            self.executor.discard_clip(clip.clip_id)
+            return None
+
+        if purpose == ENTRY:
+            self.gate.record_order_submission()
+        self._ensure_leg_subscriptions(legs)
+        return order_key
+
+    def cached_risk_block_reason(self) -> str | None:
+        # Underlying ticks can be very frequent; re-read the daemon state at most once per second
+        now = self.monotonic()
+        if now - self._risk_check_mono >= RISK_CHECK_INTERVAL_SECS:
+            self._risk_check_mono = now
+            self._risk_block_reason = self.gate.risk_daemon_block_reason()
+        return self._risk_block_reason
+
+    def _cancel(self, order_key: str, wo: WorkingOrder, clip_status: str) -> None:
+        self.executor.mark_clip_status(wo.clip_id, clip_status)
+        self.gateway.cancel(order_key)
+
+    def manage_working_orders(self) -> None:
+        if not self.working:
+            return
+        risk_block = self.cached_risk_block_reason()
+        underlying = str(self.settings.underlying_id)
+        for key, wo in list(self.working.items()):
+            view = self.gateway.order_view(key)
+            if view is None or view.is_closed:
+                self.log.warning(
+                    f"Order {key} closed without a tracked terminal event "
+                    f"({view.status if view is not None else 'missing from cache'})"
+                )
+                self.finalize(key, "CLOSED_UNTRACKED")
+                continue
+            if not view.is_open or view.is_pending_update or view.is_pending_cancel:
+                continue
+            if wo.purpose == ENTRY and risk_block is not None:
+                self.log.warning(f"Cancelling working entry {key} ({wo.combo}): {risk_block}")
+                self._cancel(key, wo, "CANCELLED_RISK")
+                continue
+            if self.spot_mid <= 0.0:
+                continue
+            prices = self.combo_prices(wo.legs, wo.side)
+            if prices is None:
+                continue
+            mid, natural = prices
+            if mid <= 0.0:
+                self.log.warning(f"Cancelling {key} ({wo.combo}): spread mid {mid:.2f} is no longer positive")
+                self._cancel(key, wo, "CANCELLED_INVALID_MID")
+                continue
+
+            actions = self.executor.on_market_tick(
+                underlying=underlying,
+                current_spot=self.spot_mid,
+                new_mid_price=mid,
+                new_natural_price=natural,
+                parent_order_id=wo.parent_id,
+            )
+            for act in actions:
+                if act["action"] == "MODIFY_LIMIT" and self.gateway.modify_price(key, act["new_limit"]):
+                    continue
+                self.log.warning(f"PassiveCombo {act['action']} {act['clip_id']}: {act.get('reason', 'NO_INSTRUMENT')}")
+                self._cancel(key, wo, "CANCELLED")
+
+    # --- Exits -----------------------------------------------------------------------------------
+
+    def evaluate_exits(self, today: date) -> list[dict[str, Any]]:
+        """Profit-target and DTE time-stop exits for spreads opened by this strategy."""
+        signals: list[dict[str, Any]] = []
+        if not len(self.book):
+            return signals
+        s = self.settings
+        working_spreads = {wo.spread_key for wo in self.working.values()}
+        net_qty = self.market.net_position_qty
+        mismatches = leg_mismatches(self.book.expected_leg_positions(), net_qty) if s.paper_routing_enabled else set()
+        book_changed = False
+
+        for key, trade in list(self.book.trades.items()):
+            open_lots = float(trade.get("open_lots") or 0.0)
+            dte = (date.fromisoformat(str(trade["expiry"])) - today).days
+            if open_lots <= 0.0 or dte < 0:
+                # Expired spreads settle at the venue; nothing left to work here
+                self.log.warning(f"Dropping {trade.get('combo')} from book (open_lots={open_lots}, dte={dte})")
+                del self.book.trades[key]
+                book_changed = True
+                continue
+
+            prices = self.combo_prices(trade["legs"], DEBIT_CLOSE)
+            entry_credit = float(trade["entry_credit"])
+            reason = exit_reason(
+                dte, prices[0] if prices is not None else None, entry_credit, s.profit_target_fraction, s.min_exit_dte
+            )
+            if reason is None:
+                continue
+
+            signal = exit_signal(key, trade, reason, open_lots, entry_credit, prices)
+            lots = int(min(open_lots, self.executor.cfg.max_child_clip_lots))
+            if not s.paper_routing_enabled:
+                pass
+            elif key in working_spreads:
+                signal["status"] = "ORDER_WORKING_ON_SPREAD"
+            elif prices is None or self.spot_mid <= 0.0:
+                signal["status"] = "NO_LIVE_QUOTES"
+            elif lots < 1:
+                signal["status"] = "NOTHING_TO_CLOSE"
+            elif not exit_confirmed(key, trade, mismatches, net_qty):
+                # Buying back a spread we may not hold would open the opposite position
+                signal["status"] = "POSITION_NOT_CONFIRMED_IN_CACHE"
+            else:
+                clip = self.executor.create_parent_plan(
+                    underlying=str(s.underlying_id),
+                    combo_label=str(trade.get("combo")),
+                    side=DEBIT_CLOSE,
+                    total_lots=lots,
+                    spot_price=self.spot_mid,
+                    net_mid_price=prices[0],
+                    net_natural_price=prices[1],
+                )[0]
+                order_key = self.route_clip(clip, EXIT, trade["legs"], trade.get("combo"), trade["expiry"])
+                signal["status"] = "EXIT_ORDER_ROUTED" if order_key else "ORDER_SUBMIT_FAILED"
+                signal["order_id"] = order_key
+                self.log.info(f"VRP exit {trade.get('combo')} {lots} lot(s): {reason} -> {signal['status']}")
+            signals.append(signal)
+
+        if book_changed:
+            self.persist_book()
+        return signals
+
+    # --- Entries ---------------------------------------------------------------------------------
+
+    def candidates(self, surface: dict[str, Any], today: date) -> list[dict[str, Any]]:
+        s = self.settings
+        return build_candidates(
+            surface,
+            spot_mid=self.spot_mid,
+            today=today,
+            symbol=s.symbol,
+            underlying=str(s.underlying_id),
+            strategy_quote=self.quotes.get,
+            cache_quote=self.market.cache_quote,
+            option_spec=self.market.option_spec,
+        )
+
+    def evaluate_candidate(self, cand: dict[str, Any], rv_20d: float, spot: float, today: date):
+        s = self.settings
+        combo = cand["combo"]
+        risk = self.pricer.evaluate_combo(
+            combo,
+            realized_vol_p=rv_20d,
+            horizon_days=min(14.0, combo.ttm_days),
+            sleeve_equity_usd=s.sleeve_equity_usd,
+        )
+        # ScenarioPricer already reports per 1-lot figures; the floor mirrors its own sizing rule
+        per_lot_es99, per_lot_ev, requested_qty = per_lot_risk(risk)
+        decision = self.gate.evaluate_combo(
+            underlying=str(s.underlying_id),
+            spot_price=spot,
+            legs=[replace(leg, qty=requested_qty) for leg in cand["gate_legs"]],
+            incremental_es99_per_lot_usd=per_lot_es99,
+            net_ev_per_lot_usd=per_lot_ev,
+            as_of=today,
+        )
+        dte = (cand["expiry"] - today).days
+        apply_dte_window(decision, dte, s.min_exit_dte)
+        return candidate_row(cand, risk, decision, dte, per_lot_es99, per_lot_ev), cand, decision
+
+    def current_entry_block_reason(self) -> str | None:
+        portfolio_ts_ns = 0
+        if self._last_fill_wall_ns:
+            portfolio_ts_ns = int(self.store.get_json(keys.PORTFOLIO_RISK).get("ts_ns") or 0)
+        return entry_block_reason(bool(self.working), self.spot_mid, self._last_fill_wall_ns, portfolio_ts_ns)
+
+    def _enter(self, best, spot: float, block_reason: str | None) -> EntryOutcome:
+        outcome = EntryOutcome()
+        if best is None:
+            return outcome
+        s = self.settings
+        row, cand, decision = best
+        preview = self.executor.create_parent_plan(
+            underlying=str(s.underlying_id),
+            combo_label=row["combo"],
+            side=CREDIT_OPEN,
+            total_lots=decision.approved_qty,
+            spot_price=spot,
+            net_mid_price=cand["mid_credit"],
+            net_natural_price=cand["nat_credit"],
+            register=False,
+        )
+        outcome.clips_planned = clip_preview_rows(preview)
+        if not s.paper_routing_enabled:
+            outcome.action = "SHADOW_SIGNAL_READY"
+        elif block_reason is not None:
+            outcome.action = f"ENTRY_DEFERRED({block_reason})"
+        else:
+            # One clip per approval; the next clip is re-gated once the book reflects this fill
+            clip = self.executor.create_parent_plan(
+                underlying=str(s.underlying_id),
+                combo_label=row["combo"],
+                side=CREDIT_OPEN,
+                total_lots=min(decision.approved_qty, self.executor.cfg.max_child_clip_lots),
+                spot_price=self.spot_mid,
+                net_mid_price=cand["mid_credit"],
+                net_natural_price=cand["nat_credit"],
+            )[0]
+            order_key = self.route_clip(clip, ENTRY, cand["legs"], row["combo"], cand["expiry"].isoformat())
+            if order_key is None:
+                outcome.action = "ORDER_SUBMIT_FAILED"
+            else:
+                outcome.action = "LIVE_PAPER_ORDER_ROUTED"
+                outcome.routed_order_ids.append(order_key)
+        return outcome
+
+    def working_rows(self) -> list[dict[str, Any]]:
+        rows = []
+        for key, wo in self.working.items():
+            clip = self.executor.active_clips.get(wo.clip_id)
+            rows.append(
+                {
+                    "client_order_id": key,
+                    "purpose": wo.purpose,
+                    "combo": wo.combo,
+                    "lots": clip.lots if clip is not None else None,
+                    "limit": clip.current_limit_price if clip is not None else None,
+                    "step": clip.step_count if clip is not None else None,
+                    "filled_lots": wo.filled_lots,
+                }
+            )
+        return rows
+
+    def on_timer(self, event_ts_ns: int, wall_ns: int, today: date) -> dict[str, Any]:
+        """One evaluation cycle; `today` is the New York trading date. Returns the published payload."""
+        s = self.settings
+        underlying = str(s.underlying_id)
+        surf = self.store.get_json(keys.surface_key(underlying))
+        rv_snap = self.store.get_json(keys.rv_key(underlying))
+        rv_20d = float(rv_snap.get("rv_20d") or 0.25)
+        spot = self.spot_mid or float(surf.get("spot") or 0.0)
+
+        self.manage_working_orders()
+        exit_signals = self.evaluate_exits(today)
+
+        evaluated = [self.evaluate_candidate(cand, rv_20d, spot, today) for cand in self.candidates(surf, today)]
+        evaluated.sort(key=lambda e: rank_key(e[0]), reverse=True)
+        rows = [e[0] for e in evaluated]
+        top_row = rows[0] if rows else None
+        best = evaluated[0] if evaluated and evaluated[0][0]["gate_approved"] else None
+
+        block_reason = self.current_entry_block_reason()
+        outcome = self._enter(best, spot, block_reason)
+
+        payload = {
+            "mode": s.mode,
+            "action": outcome.action,
+            "entry_block_reason": block_reason,
+            "underlying": underlying,
+            "spot": round(spot, 2),
+            "rv_20d": round(rv_20d, 4),
+            "candidates_scanned": len(rows),
+            "top_candidate": top_row,
+            "all_candidates": rows[:MAX_CANDIDATE_ROWS],
+            "passive_clips": outcome.clips_planned,
+            "routed_order_ids": outcome.routed_order_ids,
+            "working_orders": self.working_rows(),
+            "open_book": self.book.rows(),
+            "exit_signals": exit_signals,
+            "ts_ns": wall_ns,
+            "event_ts_ns": event_ts_ns,
+        }
+
+        raw_json = json.dumps(payload)
+        self.store.set_text(keys.VRP_LATEST, raw_json)
+        self.store.push_capped(keys.VRP_HISTORY, raw_json, HISTORY_MAX_LEN)
+
+        if top_row:
+            self.log.info(
+                f"VRP[{s.mode}] {outcome.action} | Top={top_row['combo']} "
+                f"Mid=${top_row['mid_credit']:.2f} EV=${top_row['net_ev_per_lot']:+.2f}/lot "
+                f"ES99=${top_row['es99_per_lot']:.0f} x{top_row['approved_qty']} | Reasons={top_row['gate_reasons']}"
+            )
+        return payload
+
+
+================================================================================
+FILE: src/strategies/vrp_core.py
+================================================================================
+"""Pure building blocks of the VRP income strategy: spread book, exit/entry rules, candidates and rows.
+
+Spread instruments carry ratio +1 on the leg sold at entry and -1 on the protective wing, so the spread price
+is a positive credit: entries SELL it, exits BUY it back.
+"""
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from datetime import date, timedelta
+from typing import Any
+
+from src.common.constants import DEFAULT_RISK_FREE_RATE
+from src.common.market import OptionSpec, QuoteObs
+from src.common.quotes import two_sided_mid
+from src.common.timeutil import utc_date
+from src.quant.black_scholes import extrinsic_value
+from src.quant.risk_measures import tail_loss_per_lot
+from src.risk.gate_types import CandidateLegSpec, GateDecision
+from src.scanner.verticals import VerticalPair, adjacent_verticals, split_by_right, vertical_combo
+
+ENTRY = "ENTRY"
+EXIT = "EXIT"
+STRATEGY_MIN_CREDIT = 0.05
+DEFAULT_TOB_SIZE = 10
+POSITION_TOLERANCE = 1e-6
+
+Trade = dict[str, Any]
+StrategyQuote = tuple[float, float, int, int]   # bid, ask, bid size, ask size
+
+
+# --- Spread book -----------------------------------------------------------------------------------
+
+
+def _is_open_trade(trade: Any) -> bool:
+    if not isinstance(trade, dict) or not trade.get("legs") or not trade.get("expiry"):
+        return False
+    try:
+        return float(trade.get("open_lots") or 0.0) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+class SpreadBook:
+    """Spread positions opened by the strategy, keyed by spread instrument id."""
+
+    def __init__(self, trades: Mapping[str, Trade] | None = None) -> None:
+        self.trades: dict[str, Trade] = dict(trades or {})
+
+    @classmethod
+    def from_json(cls, raw: Mapping[str, Any]) -> "SpreadBook":
+        """Keeps only well-formed open trades (persisted state may be stale or hand-edited)."""
+        return cls({str(key): trade for key, trade in raw.items() if _is_open_trade(trade)})
+
+    def to_json(self) -> dict[str, Trade]:
+        return self.trades
+
+    def __len__(self) -> int:
+        return len(self.trades)
+
+    def __contains__(self, spread_key: object) -> bool:
+        return spread_key in self.trades
+
+    def apply_entry_fill(
+        self, spread_key: str, combo: Any, legs: list[dict], expiry: str, price: float, lots: float, now_ns: int
+    ) -> Trade:
+        """Adds filled lots at a lot-weighted average entry credit (opening the trade if needed)."""
+        trade = self.trades.get(spread_key)
+        if trade is None:
+            trade = {
+                "combo": combo,
+                "legs": legs,
+                "expiry": expiry,
+                "open_lots": 0.0,
+                "entry_credit": 0.0,
+                "opened_ts_ns": now_ns,
+            }
+            self.trades[spread_key] = trade
+        prev_lots = float(trade["open_lots"])
+        trade["entry_credit"] = (float(trade["entry_credit"]) * prev_lots + price * lots) / (prev_lots + lots)
+        trade["open_lots"] = prev_lots + lots
+        return trade
+
+    def apply_exit_fill(self, spread_key: str, lots: float) -> None:
+        """Reduces open lots; a fully closed trade leaves the book."""
+        trade = self.trades.get(spread_key)
+        if trade is None:
+            return
+        trade["open_lots"] = max(0.0, float(trade["open_lots"]) - lots)
+        if trade["open_lots"] <= 1e-9:
+            del self.trades[spread_key]
+
+    def expected_leg_positions(self) -> dict[str, float]:
+        """Option leg positions the book implies (a short spread holds -lots x ratio of each leg)."""
+        expected: dict[str, float] = {}
+        for trade in self.trades.values():
+            for leg in trade["legs"]:
+                leg_id = str(leg["instrument_id"])
+                expected[leg_id] = expected.get(leg_id, 0.0) - float(trade["open_lots"]) * int(leg["ratio"])
+        return expected
+
+    def rows(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "spread_id": key,
+                "combo": trade.get("combo"),
+                "open_lots": trade.get("open_lots"),
+                "entry_credit": round(float(trade.get("entry_credit") or 0.0), 4),
+                "expiry": trade.get("expiry"),
+            }
+            for key, trade in self.trades.items()
+        ]
+
+
+# --- Exit rules ------------------------------------------------------------------------------------
+
+
+def exit_reason(
+    dte: int,
+    mid_debit: float | None,
+    entry_credit: float,
+    profit_target_fraction: float,
+    min_exit_dte: int,
+) -> str | None:
+    """Time stop inside the exit window, else profit target once the mid debit falls to the target."""
+    target_debit = entry_credit * (1.0 - profit_target_fraction)
+    if dte <= min_exit_dte:
+        return f"TIME_STOP(dte={dte}<={min_exit_dte})"
+    if mid_debit is not None and mid_debit <= target_debit:
+        return f"PROFIT_TARGET(mid_debit={mid_debit:.2f}<={target_debit:.2f})"
+    return None
+
+
+def leg_mismatches(expected: Mapping[str, float], net_position_qty: Callable[[str], float]) -> set[str]:
+    """Option legs whose open position differs from what the book implies."""
+    return {
+        leg_id
+        for leg_id, qty in expected.items()
+        if abs(net_position_qty(leg_id) - qty) > POSITION_TOLERANCE
+    }
+
+
+def exit_confirmed(
+    spread_key: str,
+    trade: Trade,
+    mismatches: set[str],
+    net_position_qty: Callable[[str], float],
+) -> bool:
+    """Closing BUYs the spread, so only do it while the cache shows the short exposure (spread or leg level)."""
+    if abs(net_position_qty(spread_key) + float(trade["open_lots"])) < POSITION_TOLERANCE:
+        return True
+    return not any(str(leg["instrument_id"]) in mismatches for leg in trade["legs"])
+
+
+def exit_signal(
+    spread_key: str,
+    trade: Trade,
+    reason: str,
+    open_lots: float,
+    entry_credit: float,
+    prices: tuple[float, float] | None,
+) -> dict[str, Any]:
+    return {
+        "combo": trade.get("combo"),
+        "spread_id": spread_key,
+        "reason": reason,
+        "open_lots": open_lots,
+        "entry_credit": round(entry_credit, 4),
+        "close_mid_debit": round(prices[0], 4) if prices is not None else None,
+        "close_natural_debit": round(prices[1], 4) if prices is not None else None,
+        "status": "SHADOW_SIGNAL",
+        "order_id": None,
+    }
+
+
+# --- Entry rules -----------------------------------------------------------------------------------
+
+
+def entry_block_reason(
+    has_working_order: bool,
+    spot_mid: float,
+    last_fill_wall_ns: int,
+    portfolio_ts_ns: int,
+) -> str | None:
+    if has_working_order:
+        return "ORDER_WORKING"
+    if spot_mid <= 0.0:
+        return "NO_UNDERLYING_QUOTE"
+    if last_fill_wall_ns and portfolio_ts_ns <= last_fill_wall_ns:
+        # Book ES99 must include the latest fill before more tail budget is committed
+        return "WAITING_PORTFOLIO_REFRESH"
+    return None
+
+
+def apply_dte_window(decision: GateDecision, dte: int, min_exit_dte: int) -> GateDecision:
+    """A spread the time stop would close right after entry is never approved."""
+    if dte <= min_exit_dte:
+        decision.reasons.append(f"DTE_INSIDE_EXIT_WINDOW({dte}<={min_exit_dte})")
+        decision.approved = False
+        decision.approved_qty = 0
+    return decision
+
+
+# --- Candidate legs --------------------------------------------------------------------------------
+
+
+def normalize_right(raw: Any) -> str:
+    right = str(raw or "").upper()
+    if right in ("P", "PUT"):
+        return "P"
+    if right in ("C", "CALL"):
+        return "C"
+    return right
+
+
+def _open_interest(raw: Any) -> int | None:
+    """Real open interest only; unknown, zero or malformed values stay None (never a placeholder)."""
+    try:
+        return int(float(raw)) if raw is not None and float(raw) > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def enrich_surface_legs(
+    raw_legs: Iterable[Mapping[str, Any]],
+    atm_iv: float,
+    default_expiry: date,
+    strategy_quote: Callable[[str], StrategyQuote | None],
+    cache_quote: Callable[[str], QuoteObs | None],
+    option_spec: Callable[[str], OptionSpec | None],
+) -> list[dict[str, Any]]:
+    """Surface leg rows overlaid with live quotes, real open interest and the leg's own expiry.
+
+    Quote precedence: the strategy's own quote stream, else the data cache, else the surface snapshot.
+    Open interest: the surface table, else instrument metadata, else unknown (None).
+    """
+    rows: list[dict[str, Any]] = []
+    for raw in raw_legs:
+        instrument_id = str(raw.get("instrument_id", ""))
+        if not instrument_id:
+            continue
+        bid = float(raw.get("bid") or 0.0)
+        ask = float(raw.get("ask") or 0.0)
+        bid_size = ask_size = DEFAULT_TOB_SIZE
+
+        own = strategy_quote(instrument_id)
+        if own is not None:
+            q_bid, q_ask, q_bsz, q_asz = own
+            if two_sided_mid(q_bid, q_ask) is not None:
+                bid, ask, bid_size, ask_size = q_bid, q_ask, q_bsz, q_asz
+        else:
+            cached = cache_quote(instrument_id)
+            if cached is not None and cached.mid is not None:
+                bid, ask = cached.bid, cached.ask
+                bid_size = int(cached.bid_size or DEFAULT_TOB_SIZE)
+                ask_size = int(cached.ask_size or DEFAULT_TOB_SIZE)
+
+        mid = two_sided_mid(bid, ask)
+        if mid is None:
+            continue
+
+        spec = option_spec(instrument_id)
+        expiry = utc_date(spec.expiry_ns) if spec is not None and spec.expiry_ns > 0 else default_expiry
+        oi_raw = raw.get("open_interest")
+        if oi_raw is None and spec is not None:
+            oi_raw = spec.open_interest
+
+        rows.append(
+            {
+                "instrument_id": instrument_id,
+                "strike": float(raw.get("strike") or 0.0),
+                "right": normalize_right(raw.get("right")),
+                "bid": bid,
+                "ask": ask,
+                "mid": mid,
+                "bid_size": bid_size,
+                "ask_size": ask_size,
+                "open_interest": _open_interest(oi_raw),
+                "expiry": expiry,
+                "raw_iv": float(raw.get("raw_iv") or atm_iv),
+                "svi_iv": float(raw.get("svi_iv") or atm_iv),
+                "residual_pts": float(raw.get("residual_pts") or 0.0),
+                "edge_to_half_spread": float(raw.get("edge_to_half_spread") or 0.0),
+                "vega": float(raw.get("vega") or 0.0),
+            }
+        )
+    return rows
+
+
+def gate_leg(row: Mapping[str, Any], side: str, spot: float) -> CandidateLegSpec:
+    """1-lot gate leg; the extrinsic value is the leg's real time value at the current spot."""
+    return CandidateLegSpec(
+        row["instrument_id"],
+        row["right"][:1],
+        side,
+        row["strike"],
+        row["expiry"],
+        qty=1,
+        bid=row["bid"],
+        ask=row["ask"],
+        bid_size=row["bid_size"],
+        ask_size=row["ask_size"],
+        open_interest=row["open_interest"],
+        extrinsic_value=extrinsic_value(row["mid"], spot, row["strike"], row["right"] == "C"),
+    )
+
+
+def spread_legs(pair: VerticalPair) -> list[dict[str, Any]]:
+    """Spread definition: +1 on the leg sold at entry, -1 on the wing => positive credit price."""
+    return [
+        {"instrument_id": pair.short["instrument_id"], "ratio": 1},
+        {"instrument_id": pair.long["instrument_id"], "ratio": -1},
+    ]
+
+
+def build_candidates(
+    surface: Mapping[str, Any],
+    *,
+    spot_mid: float,
+    today: date,
+    symbol: str,
+    underlying: str,
+    strategy_quote: Callable[[str], StrategyQuote | None],
+    cache_quote: Callable[[str], QuoteObs | None],
+    option_spec: Callable[[str], OptionSpec | None],
+) -> list[dict[str, Any]]:
+    """Defined-risk bull put / bear call spreads from surface legs overlaid with live quotes."""
+    spot = spot_mid or float(surface.get("spot") or 0.0)
+    forward = float(surface.get("forward") or spot)
+    ttm_days = float(surface.get("ttm_days") or 25.0)
+    implied_q = float(surface.get("implied_q") or 0.02)
+    atm_iv = float(surface.get("atm_iv") or 0.23)
+    raw_legs = surface.get("legs") or []
+    if spot <= 0.0 or not raw_legs:
+        return []
+
+    default_expiry = today + timedelta(days=max(1, int(round(ttm_days))))
+    rows = enrich_surface_legs(raw_legs, atm_iv, default_expiry, strategy_quote, cache_quote, option_spec)
+    puts, calls = split_by_right(rows)
+
+    candidates: list[dict[str, Any]] = []
+    for pair in adjacent_verticals(puts, calls, min_mid_credit=STRATEGY_MIN_CREDIT):
+        combo = vertical_combo(
+            pair,
+            name_symbol=symbol,
+            underlying=underlying,
+            spot=spot,
+            forward=forward,
+            ttm_days=ttm_days,
+            risk_free_rate=DEFAULT_RISK_FREE_RATE,
+            dividend_yield=implied_q,
+        )
+        candidates.append(
+            {
+                "combo": combo,
+                "gate_legs": [gate_leg(pair.short, "SELL", spot), gate_leg(pair.long, "BUY", spot)],
+                "mid_credit": pair.mid_credit,
+                "nat_credit": pair.nat_credit,
+                "legs": spread_legs(pair),
+                "expiry": pair.short["expiry"],
+            }
+        )
+    return candidates
+
+
+# --- Evaluation rows -------------------------------------------------------------------------------
+
+
+def per_lot_risk(risk: Any) -> tuple[float, float, int]:
+    """(ES99 tail loss per lot floored at $1, net EV per lot, lots to request from the gate)."""
+    return tail_loss_per_lot(risk.es_99_usd), risk.net_ev_usd, max(1, risk.recommended_contracts)
+
+
+def candidate_row(
+    cand: Mapping[str, Any],
+    risk: Any,
+    decision: GateDecision,
+    dte: int,
+    per_lot_es99: float,
+    per_lot_ev: float,
+) -> dict[str, Any]:
+    return {
+        "combo": cand["combo"].name,
+        "mid_credit": round(cand["mid_credit"], 3),
+        "nat_credit": round(cand["nat_credit"], 3),
+        "dte": dte,
+        "net_ev_per_lot": round(per_lot_ev, 2),
+        "es99_per_lot": round(per_lot_es99, 2),
+        "ev_to_es99": round(per_lot_ev / per_lot_es99, 4),
+        "pop_pct": round(risk.prob_profit * 100.0, 1),
+        "recommended_qty": risk.recommended_contracts,
+        "gate_approved": decision.approved,
+        "approved_qty": decision.approved_qty,
+        "expected_ev_usd": round(per_lot_ev * decision.approved_qty, 2),
+        "gate_reasons": decision.reasons,
+        "gate_warnings": decision.warnings,
+    }
+
+
+def rank_key(row: Mapping[str, Any]) -> tuple[bool, float, float]:
+    """Tail-budget-aware ranking: approval, expected $EV at the approved size, then EV per $ of ES99."""
+    return (row["gate_approved"], row["expected_ev_usd"], row["ev_to_es99"])
+
+
+def clip_preview_rows(clips: Sequence[Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "clip_id": c.clip_id,
+            "lots": c.lots,
+            "mid_credit": c.net_mid_price,
+            "natural_credit": c.net_natural_price,
+            "passive_limit": c.current_limit_price,
+        }
+        for c in clips
+    ]
+
+
+================================================================================
+FILE: src/risk/gate_rules.py
+================================================================================
+"""Pure pre-trade rules composed by PreTradeGate.
+
+Every rule takes plain payloads and returns its block reasons (and warnings) as strings; the gate keeps
+their order stable because the strategy and dashboard display them.
+"""
+from __future__ import annotations
+
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import date
+from typing import Any
+
+from src.common.constants import NS_PER_SEC
+from src.common.freshness import WALL_TS_FIELDS, is_fresh
+from src.common.numeric import finite_or_none, is_number
+from src.common.quotes import is_tradable_quote
+from src.quant.surface_metrics import BIAS_DEFENSIVE
+from src.risk.gate_types import CandidateLegSpec, GateConfig
+
+Payload = Mapping[str, Any]
+
+
+def snapshot_is_fresh(payload: Payload | None, now_ns: int, max_age_secs: float) -> bool:
+    """Actor snapshots are judged by their wall-clock "ts_ns"; missing, invalid or far-future stamps are stale."""
+    return is_fresh(payload, now_ns, max_age_secs, WALL_TS_FIELDS)
+
+
+def daemon_block_reason(
+    halted_text: str | None,
+    status: Payload | None,
+    now_ns: int,
+    max_status_age_secs: float,
+) -> str | None:
+    """Fail-closed daemon check: requires halted == "0" and a recent, non-halted evaluation."""
+    if halted_text is None or halted_text.strip() != "0":
+        return "RISK_DAEMON_HALTED_OR_MISSING"
+    status = status or {}
+    evaluated_ns = status.get("evaluated_at_ns")
+    if not is_number(evaluated_ns):
+        return "RISK_DAEMON_HALTED_OR_MISSING"
+    age_secs = (now_ns - float(evaluated_ns)) / NS_PER_SEC
+    if age_secs > max_status_age_secs:
+        return f"RISK_DAEMON_STALE({age_secs:.0f}s)"
+    if status.get("halted") is not False:
+        return "RISK_DAEMON_HALTED_OR_MISSING"
+    return None
+
+
+def regime_reasons(regime: Payload, now_ns: int, max_age_secs: float) -> list[str]:
+    if not snapshot_is_fresh(regime, now_ns, max_age_secs):
+        return ["MACRO_REGIME_MISSING_OR_STALE"]
+    if not regime.get("short_vol_allowed", False):
+        return [f"MACRO_REGIME_BLOCKED(ratio={regime.get('ratio')})"]
+    return []
+
+
+def surface_reasons(surface: Payload, now_ns: int, cfg: GateConfig) -> list[str]:
+    if not snapshot_is_fresh(surface, now_ns, cfg.max_input_age_secs):
+        return ["SVI_SURFACE_MISSING_OR_STALE"]
+    reasons: list[str] = []
+    if not surface.get("arb_free", False):
+        reasons.append("SVI_SURFACE_NOT_ARB_FREE")
+    rmse_pts = surface.get("rmse_vol_pts")
+    if not is_number(rmse_pts) or rmse_pts > cfg.max_svi_rmse_vol_pts:
+        reasons.append(f"SVI_FIT_POOR(rmse={rmse_pts}pts>{cfg.max_svi_rmse_vol_pts})")
+    return reasons
+
+
+def metrics_reasons(metrics: Payload, now_ns: int, max_age_secs: float) -> list[str]:
+    if not snapshot_is_fresh(metrics, now_ns, max_age_secs):
+        return ["SURFACE_METRICS_MISSING_OR_STALE"]
+    if metrics.get("strategy_bias") == BIAS_DEFENSIVE:
+        return [f"SURFACE_BIAS_DEFENSIVE(VRP={metrics.get('vrp_spread')})"]
+    return []
+
+
+def futures_check(futures: Payload, now_ns: int, cfg: GateConfig) -> tuple[list[str], list[str]]:
+    """(reasons, warnings). Futures context is advisory: only a valid, fresh cross-check can block."""
+    diff_bps = futures.get("parity_vs_fut_diff_bps")
+    if snapshot_is_fresh(futures, now_ns, cfg.max_input_age_secs) and futures.get("cross_check_valid") and is_number(diff_bps):
+        if abs(float(diff_bps)) > cfg.max_parity_fut_diff_bps:
+            return [f"FUTURES_PARITY_DIVERGENCE({diff_bps}bps)"], []
+        return [], []
+    return [], ["FUTURES_CROSS_CHECK_UNAVAILABLE"]
+
+
+def ev_reasons(net_ev_per_lot_usd: float) -> list[str]:
+    """Positive net expected value is required (after fees and half-spread slippage)."""
+    if net_ev_per_lot_usd <= 0.0:
+        return [f"NON_POSITIVE_NET_EV(${net_ev_per_lot_usd:.2f}/lot)"]
+    return []
+
+
+def portfolio_reasons(portfolio: Payload, now_ns: int, max_age_secs: float) -> list[str]:
+    """A missing, stale or unreadable book must not read as zero tail risk."""
+    if not snapshot_is_fresh(portfolio, now_ns, max_age_secs):
+        return ["PORTFOLIO_RISK_MISSING_OR_STALE"]
+    if _book_es99_or_none(portfolio) is None:
+        return ["PORTFOLIO_RISK_INVALID"]
+    return []
+
+
+def _book_es99_or_none(portfolio: Payload) -> float | None:
+    risk = portfolio.get("risk")
+    return finite_or_none(risk.get("book_es_99_usd")) if isinstance(risk, Mapping) else None
+
+
+def book_es99_usd(portfolio: Payload) -> float:
+    """Book ES99 for the budget arithmetic; 0 when unreadable, a case portfolio_reasons already blocks."""
+    value = _book_es99_or_none(portfolio)
+    return value if value is not None else 0.0
+
+
+class OrderRateLimiter:
+    """Anti-loop throttle over a sliding window of actual order submissions."""
+
+    def __init__(
+        self,
+        max_per_window: int,
+        clock: Callable[[], float] = time.monotonic,
+        window_secs: float = 60.0,
+    ) -> None:
+        self.max_per_window = max_per_window
+        self.clock = clock
+        self.window_secs = window_secs
+        self.timestamps: list[float] = []
+
+    def record(self) -> None:
+        self.timestamps.append(self.clock())
+
+    def throttle_reason(self) -> str | None:
+        now = self.clock()
+        self.timestamps = [t for t in self.timestamps if now - t < self.window_secs]
+        if len(self.timestamps) >= self.max_per_window:
+            return f"ORDER_RATE_THROTTLE({len(self.timestamps)}/min)"
+        return None
+
+
+@dataclass
+class LegCheck:
+    capped_qty: int
+    max_expiry: date
+    reasons: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    has_short_call: bool = False
+    short_call_strike: float | None = None
+    short_call_extrinsic: float | None = None
+
+
+def check_legs(legs: Sequence[CandidateLegSpec], as_of: date, cfg: GateConfig) -> LegCheck:
+    """Contract hygiene, liquidity and participation caps per leg; also finds the short call and last expiry."""
+    out = LegCheck(capped_qty=min(leg.qty for leg in legs) if legs else 0, max_expiry=as_of)
+
+    for leg in legs:
+        if leg.expiry_date > out.max_expiry:
+            out.max_expiry = leg.expiry_date
+        if leg.multiplier != 100 or leg.is_adjusted:
+            out.reasons.append(f"NON_STANDARD_CONTRACT({leg.instrument_id}, mult={leg.multiplier})")
+        if not is_tradable_quote(leg.bid, leg.ask):
+            out.reasons.append(f"INVALID_QUOTE({leg.instrument_id}: {leg.bid}/{leg.ask})")
+            continue
+
+        mid = 0.5 * (leg.bid + leg.ask)
+        spread_pct = (leg.ask - leg.bid) / max(mid, 0.01)
+        if spread_pct > cfg.max_leg_spread_pct:
+            out.reasons.append(
+                f"WIDE_MIDCAP_SPREAD({leg.instrument_id}: {spread_pct:.1%}>{cfg.max_leg_spread_pct:.1%})"
+            )
+
+        if leg.open_interest is None:
+            if cfg.allow_unknown_open_interest:
+                out.warnings.append(f"OPEN_INTEREST_UNKNOWN({leg.instrument_id})")
+            else:
+                out.reasons.append(f"OPEN_INTEREST_UNKNOWN({leg.instrument_id})")
+        else:
+            if leg.open_interest < cfg.min_open_interest:
+                out.reasons.append(
+                    f"LOW_OPEN_INTEREST({leg.instrument_id}: OI={leg.open_interest}<{cfg.min_open_interest})"
+                )
+            oi_cap = max(1, int(leg.open_interest * cfg.max_oi_participation))
+            if oi_cap < out.capped_qty:
+                out.capped_qty = oi_cap
+                out.warnings.append(f"QTY_CAPPED_BY_OI({leg.instrument_id}: {oi_cap})")
+
+        tob_size = leg.bid_size if leg.side == "SELL" else leg.ask_size
+        tob_cap = max(1, int(tob_size * cfg.max_tob_participation))
+        if tob_cap < out.capped_qty:
+            out.capped_qty = tob_cap
+            out.warnings.append(f"QTY_CAPPED_BY_TOB({leg.instrument_id}: {tob_cap})")
+
+        if leg.right == "C" and leg.side == "SELL":
+            out.has_short_call = True
+            out.short_call_strike = leg.strike
+            out.short_call_extrinsic = leg.extrinsic_value
+
+    return out
+
+
+@dataclass(frozen=True)
+class EsBudgetCheck:
+    capped_qty: int
+    reasons: list[str]
+    warnings: list[str]
+    projected_es99_usd: float
+
+
+def es_budget_check(
+    current_es99_usd: float,
+    incremental_es99_per_lot_usd: float,
+    capped_qty: int,
+    cfg: GateConfig,
+) -> EsBudgetCheck:
+    """Caps lots so the book's ES99 stays inside the sleeve tail budget."""
+    reasons: list[str] = []
+    warnings: list[str] = []
+    max_es99_usd = cfg.sleeve_equity_usd * cfg.max_book_es99_pct
+    remaining_es99 = max(0.0, max_es99_usd - current_es99_usd)
+
+    if incremental_es99_per_lot_usd > 0.0:
+        es_qty_cap = int(remaining_es99 // incremental_es99_per_lot_usd)
+        if es_qty_cap <= 0:
+            reasons.append(
+                f"SLEEVE_ES99_BUDGET_EXHAUSTED(cur=${current_es99_usd:.0f}+${incremental_es99_per_lot_usd:.0f}"
+                f">${max_es99_usd:.0f})"
+            )
+        elif es_qty_cap < capped_qty:
+            capped_qty = es_qty_cap
+            warnings.append(f"QTY_CAPPED_BY_ES99({es_qty_cap} lots)")
+
+    projected = current_es99_usd + max(0, capped_qty) * max(0.0, incremental_es99_per_lot_usd)
+    return EsBudgetCheck(capped_qty=capped_qty, reasons=reasons, warnings=warnings, projected_es99_usd=projected)
+
+
+================================================================================
+FILE: src/risk/daemon_rules.py
+================================================================================
+"""Pure risk-daemon rules: halt evaluation from snapshot payloads and transition/heartbeat tracking."""
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Any
+
+from src.common import keys
+from src.common.constants import DEFAULT_VALKEY_URL, NS_PER_SEC, SECS_PER_DAY
+from src.common.flags import is_truthy_flag
+from src.common.freshness import DAEMON_TS_FIELDS, payload_age_secs
+from src.common.numeric import is_number
+from src.common.timeutil import iso_utc
+
+Payload = dict[str, Any]
+
+
+@dataclass
+class RiskDaemonConfig:
+    valkey_url: str = DEFAULT_VALKEY_URL
+    poll_interval_sec: float = 2.0
+    max_regime_age_sec: float = 120.0
+    max_surface_age_sec: float = 120.0
+    max_rv_age_sec: float = SECS_PER_DAY
+    max_positions_age_sec: float = 120.0
+    require_positions_snapshot: bool = True
+    max_drawdown_pct: float = -5.0
+    vix_ratio_halt_threshold: float = 1.0
+    surface_keys: tuple[str, ...] = (keys.surface_key("SPY.ARCA"),)
+    rv_keys: tuple[str, ...] = (keys.rv_key("SPY.ARCA"),)
+    history_max_len: int = 2000
+    transitions_max_len: int = 500
+    jsonl_path: str = "logs/risk_history.jsonl"
+    heartbeat_log_interval_sec: float = 60.0
+    # mft:risk:halted / mft:risk:status expire unless refreshed, so a dead daemon reads as "halted"
+    state_ttl_sec: float = 10.0
+
+
+@dataclass
+class RiskEvaluation:
+    halted: bool
+    reasons: list[str]
+    reason_codes: list[str]
+    evaluated_at_ns: int
+    evaluated_at_utc: str
+    sleeve_drawdown_pct: float | None
+    vix_ratio: float | None
+    regime_age_sec: float | None
+    surface_ages_sec: dict[str, float | None]
+
+
+@dataclass(frozen=True)
+class RiskInputs:
+    """Everything one evaluation reads from Valkey (None = key missing or not a JSON object)."""
+
+    manual_halt_raw: str | None = None
+    regime: Payload | None = None
+    positions: Payload | None = None
+    surfaces: Mapping[str, Payload | None] = field(default_factory=dict)
+    rvs: Mapping[str, Payload | None] = field(default_factory=dict)
+
+
+def state_ttl_ms(cfg: RiskDaemonConfig) -> int:
+    """TTL of the halted/status keys: at least three polls, so one slow poll never expires them."""
+    return int(max(cfg.state_ttl_sec, 3.0 * cfg.poll_interval_sec) * 1000)
+
+
+def sleeve_drawdown_pct(snapshot: Payload) -> float | None:
+    """Published drawdown, else (equity - high-water mark) / high-water mark in percent."""
+    raw_dd = snapshot.get("drawdown_pct")
+    if is_number(raw_dd):
+        return float(raw_dd)
+    equity = snapshot.get("equity")
+    hwm = snapshot.get("high_water_mark")
+    if is_number(equity) and is_number(hwm) and hwm > 0:
+        return (float(equity) - float(hwm)) / float(hwm) * 100.0
+    return None
+
+
+def evaluate_risk(inputs: RiskInputs, cfg: RiskDaemonConfig, now_ns: int) -> RiskEvaluation:
+    """Fail-closed halt decision; any reason halts.
+
+    Each reason is "<code>" or "<code>:<detail>". Codes are stable (no ages or values) so transitions are
+    detected on what failed, not on how stale it is.
+    """
+    reasons: list[str] = []
+    codes: list[str] = []
+
+    def flag(code: str, detail: str | None = None) -> None:
+        codes.append(code)
+        reasons.append(f"{code}:{detail}" if detail is not None else code)
+
+    def age_of(key: str, payload: Payload) -> float | None:
+        # A payload without a usable timestamp (none, or far in the future) can't prove it is fresh
+        age = payload_age_secs(payload, now_ns, DAEMON_TS_FIELDS)
+        if age is None:
+            flag(f"invalid_timestamp:{key}")
+        return age
+
+    # 1. Explicit manual kill-switch check (never auto-cleared by daemon)
+    if is_truthy_flag(inputs.manual_halt_raw):
+        flag("manual_kill_switch_active")
+
+    # 2. Regime & VIX/VIX3M backwardation check
+    regime = inputs.regime
+    vix_ratio: float | None = None
+    regime_age_sec: float | None = None
+    if regime is None:
+        flag("missing_regime_signal")
+    else:
+        age = age_of(keys.REGIME_LATEST, regime)
+        if age is not None:
+            regime_age_sec = round(age, 2)
+            if age > cfg.max_regime_age_sec:
+                flag("stale_regime_signal", f"{age:.1f}s")
+        # The actor republishes on a timer, so a fresh payload can still carry stale index levels
+        if regime.get("is_stale") is True:
+            flag("stale_regime_feed", f"{regime.get('max_age_secs')}s")
+
+        raw_ratio = regime.get("vix_ratio")
+        if raw_ratio is None:
+            raw_ratio = regime.get("ratio")
+        if is_number(raw_ratio):
+            vix_ratio = float(raw_ratio)
+            if vix_ratio > cfg.vix_ratio_halt_threshold:
+                flag("vix_backwardation", f"{vix_ratio:.4f}>{cfg.vix_ratio_halt_threshold}")
+
+    # 3. Sleeve drawdown check from positions / equity snapshot
+    sleeve_dd_pct: float | None = None
+    positions = inputs.positions
+    if positions is None:
+        if cfg.require_positions_snapshot:
+            flag("missing_positions_snapshot")
+    else:
+        age = age_of(keys.POSITIONS_LATEST, positions)
+        if age is not None and age > cfg.max_positions_age_sec:
+            flag("stale_positions_snapshot", f"{age:.1f}s")
+        sleeve_dd_pct = sleeve_drawdown_pct(positions)
+        if sleeve_dd_pct is not None and sleeve_dd_pct <= cfg.max_drawdown_pct:
+            flag("drawdown_breach", f"{sleeve_dd_pct:.2f}%<={cfg.max_drawdown_pct:.2f}%")
+
+    # 4. Surface freshness check
+    surface_ages_sec: dict[str, float | None] = {}
+    for surf_key in cfg.surface_keys:
+        surf = inputs.surfaces.get(surf_key)
+        if surf is None:
+            surface_ages_sec[surf_key] = None
+            flag(f"missing_surface:{surf_key}")
+            continue
+        age = age_of(surf_key, surf)
+        surface_ages_sec[surf_key] = round(age, 2) if age is not None else None
+        if age is not None and age > cfg.max_surface_age_sec:
+            flag(f"stale_surface:{surf_key}", f"{age:.1f}s")
+
+    # 5. Realized volatility snapshot check
+    for rv_key in cfg.rv_keys:
+        rv = inputs.rvs.get(rv_key)
+        if rv is None:
+            flag(f"missing_rv:{rv_key}")
+            continue
+        age = age_of(rv_key, rv)
+        if age is not None and age > cfg.max_rv_age_sec:
+            flag(f"stale_rv:{rv_key}", f"{age:.0f}s")
+
+    return RiskEvaluation(
+        halted=len(reasons) > 0,
+        reasons=reasons,
+        reason_codes=codes,
+        evaluated_at_ns=now_ns,
+        evaluated_at_utc=iso_utc(now_ns),
+        sleeve_drawdown_pct=round(sleeve_dd_pct, 4) if sleeve_dd_pct is not None else None,
+        vix_ratio=round(vix_ratio, 4) if vix_ratio is not None else None,
+        regime_age_sec=regime_age_sec,
+        surface_ages_sec=surface_ages_sec,
+    )
+
+
+TRANSITION = "TRANSITION"
+HEARTBEAT = "HEARTBEAT"
+
+
+class TransitionTracker:
+    """Classifies each evaluation as a state transition, a periodic heartbeat, or neither."""
+
+    def __init__(self, heartbeat_interval_secs: float) -> None:
+        self.heartbeat_interval_secs = heartbeat_interval_secs
+        self.prev_halted: bool | None = None
+        self.prev_codes: list[str] | None = None
+        self.last_disk_write_ns: int = 0
+
+    def classify(self, halted: bool, codes: list[str], now_ns: int) -> tuple[str | None, bool | None]:
+        """(TRANSITION | HEARTBEAT | None, previous halted state) and remembers this evaluation."""
+        from_halted = self.prev_halted
+        changed = self.prev_halted is None or halted != self.prev_halted or codes != self.prev_codes
+        kind: str | None = None
+        if changed:
+            kind = TRANSITION
+            self.last_disk_write_ns = now_ns
+        elif (now_ns - self.last_disk_write_ns) / NS_PER_SEC >= self.heartbeat_interval_secs:
+            kind = HEARTBEAT
+            self.last_disk_write_ns = now_ns
+        self.prev_halted = halted
+        self.prev_codes = list(codes)
+        return kind, from_halted
+
+    def mark_error(self) -> None:
+        """After a daemon error the recovery evaluation must be logged as a transition."""
+        self.prev_halted = True
+        self.prev_codes = ["daemon_error"]
+
+
+================================================================================
+FILE: src/services/portfolio.py
+================================================================================
+"""Real-time beta-weighted book Greeks, spot x vol stress, VaR/ES, P&L attribution and sleeve drawdown."""
+from __future__ import annotations
+
+import logging
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+import numpy as np
+
+from src.common import keys
+from src.common.constants import DEFAULT_RISK_FREE_RATE, DEFAULT_VALKEY_URL, NS_PER_SEC
+from src.common.log import LogLike
+from src.common.market import OptionSpec, QuoteObs, symbol_of
+from src.common.store import JsonStore, NullStore
+from src.common.timeutil import ny_date
+from src.quant.risk_measures import parametric_book_var_es
+from src.services.portfolio_marks import (
+    GREEK_KEYS,
+    SPOT_SHOCKS_PCT,
+    VOL_SHOCKS_PTS,
+    book_stress_grid,
+    linear_stress_leg,
+    option_exposure,
+)
+from src.services.portfolio_tracking import AttributionTracker, SleeveTracker
+
+OPTION = "option"
+OPTION_SPREAD = "option_spread"
+OTHER = "other"
+
+
+@dataclass(frozen=True)
+class PortfolioSettings:
+    benchmark_id: str
+    allocated_capital_usd: float = 100_000.0
+    risk_free_rate: float = DEFAULT_RISK_FREE_RATE
+    interval_secs: int = 15
+    max_mark_quote_age_secs: float = 300.0
+    valkey_url: str = DEFAULT_VALKEY_URL
+
+
+@dataclass(frozen=True)
+class PositionView:
+    instrument_id: str
+    signed_qty: float
+    avg_px_open: float
+    realized_pnl: float = 0.0
+
+
+@dataclass(frozen=True)
+class InstrumentInfo:
+    kind: str                   # OPTION, OPTION_SPREAD or OTHER
+    multiplier: float
+    option: OptionSpec | None = None
+
+
+class BookMarket(Protocol):
+    """Instrument and quote lookups the book needs (backed by the Nautilus cache in production)."""
+
+    def instrument(self, instrument_id: str) -> InstrumentInfo | None: ...
+
+    def quote(self, instrument_id: str) -> QuoteObs | None: ...
+
+    def instruments_for_symbol(self, symbol: str) -> list[str]:
+        """Ids of non-option instruments whose symbol is `symbol` (e.g. the underlying ETF)."""
+        ...
+
+
+class EmptyBookMarket:
+    def instrument(self, instrument_id: str) -> InstrumentInfo | None:
+        return None
+
+    def quote(self, instrument_id: str) -> QuoteObs | None:
+        return None
+
+    def instruments_for_symbol(self, symbol: str) -> list[str]:
+        return []
+
+
+def _symbol_spot(symbol: str, surfaces: dict[str, dict], rv_by_symbol: dict[str, dict]) -> float | None:
+    val = (surfaces.get(symbol) or {}).get("spot") or (rv_by_symbol.get(symbol) or {}).get("spot")
+    return float(val) if val else None
+
+
+class PortfolioService:
+    def __init__(
+        self,
+        settings: PortfolioSettings,
+        store: JsonStore | None = None,
+        log: LogLike | None = None,
+        market: BookMarket | None = None,
+    ) -> None:
+        self.settings = settings
+        self.store = store if store is not None else NullStore()
+        self.log = log if log is not None else logging.getLogger(__name__)
+        self.market: BookMarket = market if market is not None else EmptyBookMarket()
+        self.attribution = AttributionTracker()
+        self.sleeve = SleeveTracker(settings.allocated_capital_usd)
+
+    def restore(self) -> None:
+        """Carries realized P&L and the high-water mark over from the last published sleeve snapshot."""
+        self.sleeve.restore(self.store.get_json(keys.POSITIONS_LATEST))
+
+    # --- Market lookups --------------------------------------------------------------------------
+
+    def live_mid(self, instrument_id: str, now_ns: int) -> float | None:
+        quote = self.market.quote(instrument_id)
+        if quote is None or quote.mid is None:
+            return None
+        if (now_ns - quote.ts_ns) / NS_PER_SEC > self.settings.max_mark_quote_age_secs:
+            return None
+        return quote.mid
+
+    def surfaces_by_symbol(self) -> dict[str, dict]:
+        """Latest SVI surface payload per underlying symbol (e.g. "SPY"), whatever its venue."""
+        return {
+            symbol_of(keys.instrument_from_surface_key(key)): payload
+            for key, payload in self.store.scan_json(keys.SURFACE_PATTERN).items()
+        }
+
+    def underlying_spot(
+        self, symbol: str, surfaces: dict[str, dict], rv_by_symbol: dict[str, dict], now_ns: int
+    ) -> float | None:
+        spot = _symbol_spot(symbol, surfaces, rv_by_symbol)
+        if spot:
+            return spot
+        for instrument_id in self.market.instruments_for_symbol(symbol):
+            mid = self.live_mid(instrument_id, now_ns)
+            if mid is not None:
+                return mid
+        return None
+
+    def spread_option_legs(self, spread_id: str) -> list[tuple[InstrumentInfo, int]] | None:
+        """Leg (instrument, ratio) pairs registered by the strategy under mft:spread_legs:<spread id>."""
+        raw_legs = self.store.get_json_value(keys.spread_legs_key(spread_id))
+        if not isinstance(raw_legs, list):
+            return None
+        legs: list[tuple[InstrumentInfo, int]] = []
+        try:
+            for leg in raw_legs:
+                info = self.market.instrument(str(leg["instrument_id"]))
+                if info is None or info.kind != OPTION or info.option is None:
+                    return None
+                legs.append((info, int(leg["ratio"])))
+        except (KeyError, TypeError, ValueError):
+            return None
+        return legs or None
+
+    # --- Evaluation ------------------------------------------------------------------------------
+
+    def _exposure(
+        self,
+        info: InstrumentInfo,
+        qty: float,
+        now_ns: int,
+        surfaces: dict[str, dict],
+        rv_by_symbol: dict[str, dict],
+        bench_spot: float,
+        bench_atm_iv: float,
+    ) -> dict[str, Any] | None:
+        option = info.option
+        und_symbol = symbol_of(option.underlying)
+        spot = self.underlying_spot(und_symbol, surfaces, rv_by_symbol, now_ns)
+        if spot is None or spot <= 0.0:
+            return None
+        return option_exposure(
+            option,
+            info.multiplier,
+            qty,
+            now_ns,
+            spot=spot,
+            surface=surfaces.get(und_symbol) or {},
+            rv=rv_by_symbol.get(und_symbol) or {},
+            bench_spot=bench_spot,
+            bench_atm_iv=bench_atm_iv,
+            r=self.settings.risk_free_rate,
+            live_mid=self.live_mid(option.instrument_id, now_ns),
+        )
+
+    def evaluate(
+        self,
+        positions: Sequence[PositionView],
+        closed_realized_usd: float,
+        wall_ns: int,
+    ) -> dict[str, Any]:
+        """Marks every open position, aggregates exposures and risk, and publishes the book and sleeve."""
+        now_ns = wall_ns
+        bench_id = str(self.settings.benchmark_id)
+        bench_symbol = symbol_of(bench_id)
+        surfaces = self.surfaces_by_symbol()
+        surf = surfaces.get(bench_symbol) or {}
+        rv_univ = self.store.get_json(keys.RV_UNIVERSE)
+        rv_by_symbol = {symbol_of(k): v for k, v in rv_univ.items() if isinstance(v, dict)}
+        bench_rv = rv_univ.get(bench_id) or self.store.get_json(keys.rv_key(bench_id))
+
+        bench_spot = float(surf.get("spot") or bench_rv.get("spot") or 0.0)
+        bench_atm_iv = float(surf.get("atm_iv") or bench_rv.get("rv_20d") or 0.20)
+
+        totals = dict.fromkeys(GREEK_KEYS, 0.0)
+        unrealized_pnl_usd = 0.0
+        session_realized_usd = closed_realized_usd + sum(float(p.realized_pnl) for p in positions)
+        legs_spec: list[dict] = []
+        position_rows: list[dict] = []
+
+        for pos in positions:
+            iid = str(pos.instrument_id)
+            info = self.market.instrument(iid)
+            signed_qty = float(pos.signed_qty)
+            avg_px = float(pos.avg_px_open)
+            pos_greeks = dict.fromkeys(GREEK_KEYS, 0.0)
+
+            option_legs: list[tuple[InstrumentInfo, int]] | None = None
+            if info is not None and info.kind == OPTION and info.option is not None:
+                option_legs = [(info, 1)]
+            elif info is not None:
+                option_legs = self.spread_option_legs(iid)
+
+            if option_legs is not None:
+                exposures: list[tuple[int, dict]] | None = []
+                for leg_info, ratio in option_legs:
+                    exp = self._exposure(
+                        leg_info, signed_qty * ratio, now_ns, surfaces, rv_by_symbol, bench_spot, bench_atm_iv
+                    )
+                    if exp is None:
+                        exposures = None
+                        break
+                    exposures.append((ratio, exp))
+
+                if exposures is None:
+                    mark_px, mark_source, pos_pnl = avg_px, "UNPRICED_UNDERLYING", 0.0
+                else:
+                    # Spread price = sum(ratio x leg price); per-share like the legs, so use the leg multiplier
+                    mult = exposures[0][1]["multiplier"]
+                    mark_px = sum(ratio * exp["mark"] for ratio, exp in exposures)
+                    sources = {exp["mark_source"] for _, exp in exposures}
+                    mark_source = sources.pop() if len(sources) == 1 else "MIXED"
+                    pos_pnl = signed_qty * mult * (mark_px - avg_px)
+                    for _, exp in exposures:
+                        for key in GREEK_KEYS:
+                            pos_greeks[key] += exp["greeks"][key]
+                        legs_spec.append(exp["stress_leg"])
+            elif info is not None and info.kind == OPTION_SPREAD:
+                # Spread without registered legs: no reliable model, never mark it at the underlying's price
+                live_mid = self.live_mid(iid, now_ns)
+                mark_px = live_mid if live_mid is not None else avg_px
+                mark_source = "UNMODELED_SPREAD"
+                pos_pnl = signed_qty * info.multiplier * (mark_px - avg_px)
+            else:
+                mult = info.multiplier if info is not None else 1.0
+                mark_px = self.live_mid(iid, now_ns)
+                mark_source = "LIVE_MID"
+                if mark_px is None:
+                    mark_px = _symbol_spot(symbol_of(iid), surfaces, rv_by_symbol)
+                    mark_source = "ACTOR_SPOT"
+                if mark_px is None or mark_px <= 0.0:
+                    mark_px, mark_source = avg_px, "ENTRY_PRICE"
+                pos_pnl = signed_qty * mult * (mark_px - avg_px)
+                pos_greeks["delta"] = signed_qty * mult
+                # Notional-weighted SPY share equivalents (e.g. 1 MES ~ 5 x index / SPY spot)
+                pos_greeks["beta_delta"] = (
+                    signed_qty * mult * mark_px / bench_spot if bench_spot > 0 else signed_qty * mult
+                )
+                legs_spec.append(linear_stress_leg(signed_qty, mult, mark_px))
+
+            unrealized_pnl_usd += pos_pnl
+            for key in GREEK_KEYS:
+                totals[key] += pos_greeks[key]
+            position_rows.append(
+                {
+                    "instrument": iid,
+                    "qty": signed_qty,
+                    "avg_px": round(avg_px, 3),
+                    "mark_px": round(mark_px, 3),
+                    "mark_source": mark_source,
+                    "pnl_usd": round(pos_pnl, 2),
+                    "delta_sh": round(pos_greeks["delta"], 2),
+                    "vega_1v": round(pos_greeks["vega_1v"], 2),
+                    "theta_day": round(pos_greeks["theta_day"], 2),
+                }
+            )
+
+        net_delta_shares = totals["delta"]
+        beta_delta_shares = totals["beta_delta"]
+        net_gamma_1pct = totals["gamma_1pct"]
+        net_vega_1v = totals["vega_1v"]
+        net_theta_day = totals["theta_day"]
+        realized_pnl_usd = self.sleeve.realized_carry_usd + session_realized_usd
+        total_pnl_usd = realized_pnl_usd + unrealized_pnl_usd
+
+        book_key = tuple(sorted((str(p.instrument_id), round(float(p.signed_qty), 6)) for p in positions))
+        attribution = self.attribution.update(
+            ny_date(now_ns).isoformat(),
+            book_key,
+            bench_spot,
+            bench_atm_iv,
+            total_pnl_usd,
+            {
+                "delta_sh": net_delta_shares,
+                "gamma_1pct": net_gamma_1pct,
+                "vega_1v": net_vega_1v,
+                "theta_day": net_theta_day,
+            },
+            now_ns,
+        )
+
+        stress_grid = book_stress_grid(legs_spec, self.settings.risk_free_rate)
+        worst_stress_usd = float(np.min(stress_grid))
+
+        # Approximate P-measure 1-day 99% VaR / ES from book Delta/Gamma/Vega + RV20
+        rv_20d = float(bench_rv.get("rv_20d") or bench_atm_iv)
+        book_var_99_usd, book_es_99_usd = parametric_book_var_es(beta_delta_shares, net_vega_1v, bench_spot, rv_20d)
+
+        # Sleeve equity is decoupled from IBKR NLV: allocated capital + this book's P&L
+        sleeve = self.sleeve.snapshot(realized_pnl_usd, unrealized_pnl_usd, len(positions), now_ns)
+
+        payload = {
+            "benchmark": bench_id,
+            "benchmark_spot": round(bench_spot, 2),
+            "open_positions": len(positions),
+            "realized_pnl_usd": round(realized_pnl_usd, 2),
+            "unrealized_pnl_usd": round(unrealized_pnl_usd, 2),
+            "total_pnl_usd": round(total_pnl_usd, 2),
+            "greeks": {
+                "net_delta_shares": round(net_delta_shares, 2),
+                "beta_delta_shares": round(beta_delta_shares, 2),
+                "net_gamma_1pct_shares": round(net_gamma_1pct, 3),
+                "net_vega_1v_usd": round(net_vega_1v, 2),
+                "net_theta_day_usd": round(net_theta_day, 2),
+                "net_vanna_1v": round(totals["vanna"], 3),
+                "net_charm_day": round(totals["charm_day"], 3),
+            },
+            "risk": {
+                "book_var_99_usd": book_var_99_usd,
+                "book_es_99_usd": book_es_99_usd,
+                "worst_7d_stress_usd": round(worst_stress_usd, 2),
+                "spot_shocks_pct": list(SPOT_SHOCKS_PCT),
+                "vol_shocks_pts": list(VOL_SHOCKS_PTS),
+                "stress_grid_usd": stress_grid,
+            },
+            "attribution": attribution,
+            "sleeve": sleeve,
+            "positions": position_rows,
+            "ts_ns": now_ns,
+        }
+
+        batch = self.store.batch()
+        batch.set_json(keys.PORTFOLIO_RISK, payload)
+        # Drawdown input for the out-of-process risk daemon
+        batch.set_json(keys.POSITIONS_LATEST, sleeve)
+        batch.execute()
+
+        self.log.info(
+            f"PortfolioBook open={len(positions)} PnL=${total_pnl_usd:+.2f} DD={sleeve['drawdown_pct']:+.2f}% "
+            f"BetaDelta={beta_delta_shares:+.1f}sh Vega=${net_vega_1v:+.2f}/v "
+            f"Theta=${net_theta_day:+.2f}/d ES99=${book_es_99_usd:.2f}"
+        )
+        return payload
+
+
+================================================================================
+FILE: src/quant/realized_vol.py
+================================================================================
+"""Physical (P-measure) realized volatility, jump share, correlation and percentile helpers."""
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping
+
+import numpy as np
+import pandas as pd
+from scipy.stats import percentileofscore
+
+from src.common.constants import NY_TZ_NAME, TRADING_DAYS_PER_YEAR
+
+
+def yang_zhang_rv(df: pd.DataFrame, window: int, ann: int = TRADING_DAYS_PER_YEAR) -> float:
+    """Annualized Yang-Zhang realized volatility over the last `window` OHLC bars.
+
+    With fewer than window + 1 bars it falls back to close-to-close volatility of what is available.
+    """
+    if window <= 0 or ann <= 0 or df.empty:
+        return 0.0
+    required = ("open", "high", "low", "close")
+    if any(column not in df for column in required):
+        return 0.0
+    prices = df[list(required)].to_numpy(dtype=np.float64)
+    if prices.shape[0] == 0 or not np.isfinite(prices).all() or (prices <= 0.0).any():
+        return 0.0
+
+    if len(df) < window + 1:
+        rets = np.log(df["close"] / df["close"].shift(1)).dropna()
+        return float(rets.std(ddof=1) * np.sqrt(ann)) if len(rets) > 1 else 0.0
+
+    sub = df.iloc[-(window + 1):].copy()
+    prev_close = sub["close"].shift(1)
+    log_oc = np.log(sub["open"] / prev_close).iloc[1:]
+    log_co = np.log(sub["close"] / sub["open"]).iloc[1:]
+    log_ho = np.log(sub["high"] / sub["open"]).iloc[1:]
+    log_lo = np.log(sub["low"] / sub["open"]).iloc[1:]
+    log_hc = np.log(sub["high"] / sub["close"]).iloc[1:]
+    log_lc = np.log(sub["low"] / sub["close"]).iloc[1:]
+
+    rs = (log_ho * log_hc + log_lo * log_lc).mean()
+    var_o = log_oc.var(ddof=1)
+    var_c = log_co.var(ddof=1)
+    k = 0.34 / (1.34 + (window + 1) / max(window - 1, 1))
+    yz_var = max(float(var_o + k * var_c + (1.0 - k) * rs), 1e-10)
+    return float(np.sqrt(yz_var * ann))
+
+
+def bipower_jump_ratio(df: pd.DataFrame, window: int = 20) -> float:
+    """Fraction of recent variance attributable to discrete jumps: (RV - BV) / RV, clipped to [0, 1]."""
+    if window <= 0 or df.empty or "close" not in df:
+        return 0.0
+    closes = df["close"].to_numpy(dtype=np.float64)
+    if not np.isfinite(closes).all() or (closes <= 0.0).any():
+        return 0.0
+    rets = np.log(df["close"] / df["close"].shift(1)).dropna().to_numpy(dtype=np.float64)
+    if len(rets) < window + 1:
+        return 0.0
+    r = rets[-window:]
+    rv = float(np.sum(r ** 2))
+    if rv <= 1e-12:
+        return 0.0
+    # mu_1 = sqrt(2/pi) -> (pi/2) * sum(|r_t| * |r_{t-1}|)
+    bv = float((np.pi / 2.0) * np.sum(np.abs(r[1:]) * np.abs(r[:-1])))
+    return float(np.clip((rv - bv) / rv, 0.0, 1.0))
+
+
+def daily_log_returns(df: pd.DataFrame) -> pd.Series:
+    """Close-to-close log returns indexed by New York trading date (one row per date, last close wins)."""
+    dates = (
+        pd.to_datetime(df["ts_ns"].astype("int64"), unit="ns", utc=True)
+        .dt.tz_convert(NY_TZ_NAME)
+        .dt.date
+    )
+    closes = pd.Series(df["close"].astype(float).to_numpy(), index=dates.to_numpy())
+    closes = closes[~closes.index.duplicated(keep="last")]
+    return np.log(closes / closes.shift(1)).dropna()
+
+
+def avg_pairwise_corr(
+    returns_by_symbol: Mapping[str, pd.Series], window: int = 20, min_rows: int = 5
+) -> float:
+    """Mean off-diagonal correlation of returns aligned on their index (trading date), last `window` rows."""
+    if len(returns_by_symbol) < 2:
+        return 0.0
+    mat = pd.DataFrame(dict(returns_by_symbol)).sort_index().dropna().iloc[-window:]
+    if len(mat) < min_rows:
+        return 0.0
+    corr = mat.corr().to_numpy()
+    n = corr.shape[0]
+    off_diag = corr[np.triu_indices(n, k=1)]
+    finite = off_diag[np.isfinite(off_diag)]
+    return float(np.mean(finite)) if len(finite) > 0 else 0.0
+
+
+def percentile_rank(
+    history: Iterable[float],
+    value: float,
+    *,
+    default: float = 50.0,
+    min_count: int = 1,
+    decimals: int | None = None,
+) -> float:
+    """Share (in %) of history at or below value (scipy's "weak" percentile of score); NaNs are ignored.
+
+    default when history has fewer than min_count usable points.
+    """
+    arr = np.asarray(list(history), dtype=np.float64)
+    arr = arr[~np.isnan(arr)]
+    if arr.size < max(min_count, 1):
+        return default
+    pct = float(percentileofscore(arr, value, kind="weak"))
+    return float(round(pct, decimals)) if decimals is not None else pct
+
+
+def trailing_rolling_rv(
+    df: pd.DataFrame,
+    window: int = 20,
+    ann: int = TRADING_DAYS_PER_YEAR,
+    lookback: int | None = None,
+) -> np.ndarray:
+    """Yang-Zhang RV(window) at each of the last `lookback` (default `ann`) history end points."""
+    n = len(df)
+    lookback = ann if lookback is None else lookback
+    first_end = max(window + 1, n - lookback + 1)
+    return np.asarray(
+        [yang_zhang_rv(df.iloc[:end], window, ann) for end in range(first_end, n + 1)],
+        dtype=np.float64,
+    )
+
+
+================================================================================
+FILE: src/backtest/vrp_walkforward.py
+================================================================================
+"""Walk-forward mid-cap VRP simulation on a daily option chain, with passive fill haircuts and friction."""
+from __future__ import annotations
+
+import math
+from datetime import date, timedelta
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from src.common.constants import DEFAULT_RISK_FREE_RATE
+from src.common.timeutil import days_to_years
+from src.execution.passive_combo import CREDIT_OPEN, PassiveComboExecutor
+from src.risk.calendar import EventCalendarLike, default_event_calendar
+from src.scanner.combos import CandidateCombo, CandidateLeg
+
+HOLDING_DAYS = 14
+TARGET_DTE_DAYS = 30
+MIN_VRP = 0.025
+SHORT_STRIKE_MAX_FRAC = 0.94
+MIN_MID_CREDIT = 0.25
+MIN_NATURAL_CREDIT = 0.05
+EXIT_TIME_VALUE_SHARE = 0.35
+ROUND_TRIP_COMMISSION_PER_LOT = 2.60
+ASSUMED_CARRY = 0.03
+ASSUMED_DIVIDEND_YIELD = 0.0125
+
+
+def select_put_spread(day_df: pd.DataFrame, spot: float) -> tuple[pd.Series, pd.Series] | None:
+    """(short, wing) puts: the highest strike at or below 94% of spot, and two strikes further down."""
+    puts = day_df[day_df["right"] == "P"].sort_values("strike")
+    short_candidates = puts[puts["strike"] <= spot * SHORT_STRIKE_MAX_FRAC]
+    if len(short_candidates) < 3:
+        return None
+    return short_candidates.iloc[-1], short_candidates.iloc[-3]
+
+
+def approx_exit_pnl(
+    short_strike: float,
+    long_strike: float,
+    width: float,
+    entry_fill: float,
+    end_spot: float,
+    lots: int,
+) -> float:
+    """Net USD P&L of closing at the horizon: intrinsic loss plus a share of the remaining credit as exit cost.
+
+    The exit debit is capped at the spread width; round-trip commissions are charged per lot.
+    """
+    intrinsic_loss = max(0.0, short_strike - end_spot) - max(0.0, long_strike - end_spot)
+    exit_debit = min(width, intrinsic_loss + EXIT_TIME_VALUE_SHARE * max(0.0, entry_fill - intrinsic_loss))
+    return ((entry_fill - exit_debit) * 100.0 - ROUND_TRIP_COMMISSION_PER_LOT) * lots
+
+
+def put_spread_combo(symbol: str, spot: float, short: pd.Series, wing: pd.Series, mid_credit: float, width: float) -> CandidateCombo:
+    def leg(name: str, row: pd.Series, side: int) -> CandidateLeg:
+        iv = float(row["iv"])
+        return CandidateLeg(name, float(row["strike"]), "P", side, 1, float(row["bid"]), float(row["ask"]), float(row["mid"]), iv, iv, 0.0, 1.0)
+
+    return CandidateCombo(
+        name=f"{symbol} {int(short['strike'])}/{int(wing['strike'])}P Bull Put",
+        strategy_type="BULL_PUT_SPREAD",
+        underlying=symbol,
+        spot=spot,
+        forward=spot * math.exp(ASSUMED_CARRY * days_to_years(TARGET_DTE_DAYS)),
+        ttm_days=float(TARGET_DTE_DAYS),
+        risk_free_rate=DEFAULT_RISK_FREE_RATE,
+        dividend_yield=ASSUMED_DIVIDEND_YIELD,
+        legs=[leg("SP", short, -1), leg("LP", wing, +1)],
+        net_credit=mid_credit,
+        max_width=width,
+    )
+
+
+def run_midcap_vrp_backtest(
+    df: pd.DataFrame,
+    sleeve_equity_usd: float = 100_000.0,
+    passive_touch_fill_prob: float = 0.50,
+    seed: int = 42,
+    *,
+    symbol: str = "MIDX",
+    calendar: EventCalendarLike | None = None,
+    pricer: Any = None,
+    executor: PassiveComboExecutor | None = None,
+) -> dict[str, Any]:
+    """Walk-forward mid-cap VRP simulation with passive fill haircuts & realistic friction.
+
+    df holds one row per option per day: date (ISO), spot, rv_20d, atm_iv, right, strike, bid, ask, mid, iv.
+    """
+    if pricer is None:
+        from src.risk.scenario_pricer import ScenarioPricer
+
+        pricer = ScenarioPricer(n_scenarios=5_000, commission_per_leg=0.65, slippage_fraction=0.50)
+    executor = executor or PassiveComboExecutor()
+    calendar = calendar if calendar is not None else default_event_calendar()
+    rng = np.random.default_rng(seed)
+
+    equity = sleeve_equity_usd
+    equity_curve = [equity]
+    trades: list[dict[str, Any]] = []
+    skipped_unfilled = 0
+
+    grouped = list(df.groupby("date", sort=True))
+    idx = 0
+    while idx < len(grouped) - (HOLDING_DAYS + 1):
+        dt_str, day_df = grouped[idx]
+        as_of = date.fromisoformat(dt_str)
+        spot = float(day_df["spot"].iloc[0])
+        rv_20d = float(day_df["rv_20d"].iloc[0])
+        vrp = float(day_df["atm_iv"].iloc[0]) - rv_20d
+
+        # Require positive VRP (+2.5 vol pts) and clean event calendar
+        ev_chk = calendar.check_entry(symbol, as_of=as_of, expiry_date=as_of + timedelta(days=TARGET_DTE_DAYS))
+        if vrp < MIN_VRP or not ev_chk.allowed:
+            idx += 1
+            continue
+
+        pair = select_put_spread(day_df, spot)
+        if pair is None:
+            idx += 1
+            continue
+        short, wing = pair
+        width = float(short["strike"] - wing["strike"])
+        mid_credit = float(short["mid"] - wing["mid"])
+        nat_credit = float(short["bid"] - wing["ask"])
+        if mid_credit <= MIN_MID_CREDIT or nat_credit <= MIN_NATURAL_CREDIT:
+            idx += 1
+            continue
+
+        combo = put_spread_combo(symbol, spot, short, wing, mid_credit, width)
+        risk = pricer.evaluate_combo(combo, realized_vol_p=rv_20d, horizon_days=float(HOLDING_DAYS), sleeve_equity_usd=equity)
+        if not risk.approved:
+            idx += 1
+            continue
+
+        # Conservative passive execution simulation: fill probability when touched; the plan is a preview only
+        clips = executor.create_parent_plan(
+            symbol, combo.name, CREDIT_OPEN, risk.recommended_contracts, spot, mid_credit, nat_credit, register=False
+        )
+        if rng.random() > passive_touch_fill_prob:
+            skipped_unfilled += 1
+            idx += 1
+            continue
+
+        entry_fill = clips[0].current_limit_price
+        lots = risk.recommended_contracts
+
+        # Hold up to 14 days (approximate mid-horizon exit value + exit friction + round-trip commissions)
+        exit_idx = min(idx + HOLDING_DAYS, len(grouped) - 1)
+        end_spot = float(grouped[exit_idx][1]["spot"].iloc[0])
+        net_pnl_usd = approx_exit_pnl(float(short["strike"]), float(wing["strike"]), width, entry_fill, end_spot, lots)
+
+        equity += net_pnl_usd
+        equity_curve.append(equity)
+        trades.append({"entry_date": dt_str, "lots": lots, "entry_credit": entry_fill, "pnl_usd": round(net_pnl_usd, 2)})
+        idx = exit_idx + 1
+
+    curve = np.asarray(equity_curve, dtype=float)
+    max_dd_pct = float(np.min(curve / np.maximum.accumulate(curve) - 1.0))
+    pnls = np.array([t["pnl_usd"] for t in trades], dtype=float)
+    return {
+        "starting_equity": sleeve_equity_usd,
+        "ending_equity": round(equity, 2),
+        "total_return_pct": round(((equity - sleeve_equity_usd) / sleeve_equity_usd) * 100.0, 2),
+        "max_drawdown_pct": round(max_dd_pct * 100.0, 2),
+        "completed_trades": len(trades),
+        "unfilled_passive_orders": skipped_unfilled,
+        "win_rate_pct": round(float(np.mean(pnls > 0) * 100.0), 1) if len(pnls) else 0.0,
+        "avg_pnl_per_trade": round(float(np.mean(pnls)), 2) if len(pnls) else 0.0,
+    }
+
+
+================================================================================
+FILE: src/adapters/order_gateway.py
+================================================================================
+"""Nautilus implementations of the VRP engine's OrderGateway and MarketView protocols."""
+from __future__ import annotations
+
+from typing import Any
+
+from nautilus_trader.model import (
+    InstrumentId,
+    OptionContract,
+    OptionSpread,
+    OrderSide,
+    Symbol,
+    TimeInForce,
+)
+
+from src.adapters.extract import option_spec_from_instrument
+from src.adapters.nautilus import quote_obs
+from src.common.market import OptionSpec, QuoteObs
+from src.execution.passive_combo import CREDIT_OPEN
+from src.strategies.vrp_engine import OrderView, PreparedOrder
+
+
+class NautilusOrderGateway:
+    """Builds (and caches) OptionSpread instruments and DAY limit orders through the strategy ports."""
+
+    def __init__(self, ports: Any) -> None:
+        self.ports = ports
+        self._spreads: dict[tuple[tuple[str, int], ...], Any] = {}
+        self._client_ids: dict[str, Any] = {}
+
+    def spread_instrument(self, legs: list[dict]) -> Any:
+        signature = tuple((str(leg["instrument_id"]), int(leg["ratio"])) for leg in legs)
+        spread = self._spreads.get(signature)
+        if spread is None:
+            parsed_legs = [(InstrumentId.from_str(iid), ratio) for iid, ratio in signature]
+            contracts = [self.ports.instrument(instrument_id) for instrument_id, _ in parsed_legs]
+            if not all(isinstance(contract, OptionContract) for contract in contracts):
+                raise ValueError("Every spread leg must refer to a cached OptionContract")
+
+            first = contracts[0]
+            if any(
+                (contract.underlying, contract.expiration_ns, contract.currency, contract.multiplier)
+                != (first.underlying, first.expiration_ns, first.currency, first.multiplier)
+                for contract in contracts[1:]
+            ):
+                raise ValueError("Spread legs must share an underlying, expiration, currency, and multiplier")
+
+            venues = {str(instrument_id.venue) for instrument_id, _ in parsed_legs}
+            if len(venues) != 1:
+                raise ValueError("Spread legs must share a venue")
+
+            raw_symbol = "SPREAD-" + "-".join(
+                f"{instrument_id.symbol}".replace(" ", "-")
+                + ("-P" if ratio >= 0 else "-M")
+                + str(abs(ratio))
+                for instrument_id, ratio in parsed_legs
+            )
+            symbol = Symbol.from_str(raw_symbol)
+            venue = next(iter(venues))
+            now_ns = self.ports.now_ns()
+            spread = OptionSpread(
+                instrument_id=InstrumentId.from_str(f"{symbol}.{venue}"),
+                raw_symbol=symbol,
+                asset_class=first.asset_class,
+                underlying=first.underlying,
+                strategy_type="CUSTOM",
+                activation_ns=first.activation_ns,
+                expiration_ns=first.expiration_ns,
+                currency=first.currency,
+                price_precision=first.price_precision,
+                price_increment=first.price_increment,
+                multiplier=first.multiplier,
+                lot_size=first.lot_size,
+                ts_event=now_ns,
+                ts_init=now_ns,
+                info={
+                    "legs": [
+                        {"instrument_id": str(instrument_id), "ratio": ratio}
+                        for instrument_id, ratio in parsed_legs
+                    ]
+                },
+            )
+            self.ports.add_instrument(spread)
+            self._spreads[signature] = spread
+        return spread
+
+    def prepare(self, legs: list[dict], side: str, lots: int, limit_price: float) -> PreparedOrder:
+        spread = self.spread_instrument(legs)
+        order = self.ports.limit_order(
+            spread.id,
+            OrderSide.SELL if side == CREDIT_OPEN else OrderSide.BUY,
+            spread.make_qty(lots),
+            spread.make_price(limit_price),
+            TimeInForce.DAY,
+        )
+        order_key = str(order.client_order_id)
+        self._client_ids[order_key] = order.client_order_id
+        return PreparedOrder(order_key=order_key, spread_id=str(spread.id), handle=order)
+
+    def submit(self, order: PreparedOrder) -> None:
+        self.ports.submit(order.handle)
+
+    def _order(self, order_key: str) -> Any:
+        client_order_id = self._client_ids.get(order_key)
+        return self.ports.order(client_order_id) if client_order_id is not None else None
+
+    def order_view(self, order_key: str) -> OrderView | None:
+        order = self._order(order_key)
+        if order is None:
+            return None
+        return OrderView(
+            is_open=bool(order.is_open),
+            is_closed=bool(order.is_closed),
+            is_pending_update=bool(order.is_pending_update),
+            is_pending_cancel=bool(order.is_pending_cancel),
+            status=str(order.status),
+        )
+
+    def modify_price(self, order_key: str, price: float) -> bool:
+        order = self._order(order_key)
+        instrument = self.ports.instrument(order.instrument_id) if order is not None else None
+        if instrument is None:
+            return False
+        self.ports.modify_price(order, instrument.make_price(price))
+        return True
+
+    def cancel(self, order_key: str) -> None:
+        order = self._order(order_key)
+        if order is not None:
+            self.ports.cancel(order)
+
+
+class NautilusMarketView:
+    """Cache quotes, option metadata, net positions and on-demand quote subscriptions."""
+
+    def __init__(self, ports: Any) -> None:
+        self.ports = ports
+        self.subscribed: set[str] = set()
+
+    def cache_quote(self, instrument_id: str) -> QuoteObs | None:
+        tick = self.ports.quote(instrument_id)
+        return quote_obs(tick) if tick is not None else None
+
+    def option_spec(self, instrument_id: str) -> OptionSpec | None:
+        instrument = self.ports.instrument(instrument_id)
+        return option_spec_from_instrument(instrument) if isinstance(instrument, OptionContract) else None
+
+    def net_position_qty(self, instrument_id: str) -> float:
+        return sum(float(p.signed_qty) for p in self.ports.positions_open(instrument_id))
+
+    def ensure_subscribed(self, instrument_id: str) -> None:
+        if instrument_id in self.subscribed or self.ports.instrument(instrument_id) is None:
+            return
+        self.ports.subscribe_quotes(instrument_id)
+        self.subscribed.add(instrument_id)

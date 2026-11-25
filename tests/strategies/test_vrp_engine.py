@@ -9,7 +9,7 @@ from src.common import keys
 from src.common.market import QuoteObs
 from src.execution.passive_combo import PassiveComboExecutor
 from src.strategies.vrp_engine import VrpEngine, VrpSettings
-from tests.factories import NOW_NS, portfolio_payload, risk_assessment, rv_payload, surface_leg, surface_payload
+from tests.factories import NOW_NS, ago, portfolio_payload, risk_assessment, rv_payload, surface_leg, surface_payload
 from tests.fakes import FakeGate, FakeMarket, FakeOrderGateway, FakePricer, written
 
 SPY = "SPY.ARCA"
@@ -298,7 +298,56 @@ def test_stop_cancels_open_orders_and_persists_the_book(make_rig):
     assert rig.valkey.exists(keys.vrp_book_key(SPY))
 
 
-# --- Exits -----------------------------------------------------------------------------------------
+# --- RV fail-closed --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "rv_overrides",
+    [
+        {"rv_20d": 0.0},          # Zero RV -> STAND_DOWN
+        {"rv_20d": -0.1},         # Negative RV -> STAND_DOWN
+        {"rv_20d": float("nan")},  # NaN RV -> STAND_DOWN
+        {"ts_ns": ago(90000.0)},  # Stale RV (ts > 1 day old) -> STAND_DOWN
+        {"rv_20d": None},         # Missing/null rv_20d -> STAND_DOWN
+    ],
+)
+def test_invalid_rv_blocks_entries_but_allows_exits(make_rig, store, rv_overrides):
+    """Missing, zero, stale or non-finite rv_20d forces STAND_DOWN with RV_MISSING_OR_INVALID."""
+    OPEN_TRADE = {"combo": "SPY 690/685P Bull Put", "legs": LEGS, "expiry": "2026-12-18", "open_lots": 4.0, "entry_credit": 0.6}
+    rig = make_rig(book={SPREAD_ID: OPEN_TRADE})
+    rig.market.positions[SPREAD_ID] = -4.0
+    quote_legs(rig)
+    spot(rig)
+
+    # Replace RV with the invalid variant
+    store.set_json(keys.rv_key(SPY), rv_payload(**rv_overrides))
+
+    # Use a date inside the exit window so evaluate_exits fires
+    payload = rig.engine.on_timer(event_ts_ns=NOW_NS, wall_ns=NOW_NS, today=date(2026, 12, 5))
+
+    # Must block entries
+    assert payload["action"] == "STAND_DOWN"
+    assert payload["entry_block_reason"] == "RV_MISSING_OR_INVALID"
+    assert payload["rv_20d"] is None
+    assert payload["candidates_scanned"] == 0
+
+    # Must still evaluate exits
+    assert len(payload["exit_signals"]) > 0
+
+
+def test_valid_rv_proceeds_normally(make_rig, store):
+    """A fresh, positive rv_20d evaluates candidates normally (regression check)."""
+    rig = make_rig()
+    quote_legs(rig)
+    spot(rig)
+
+    store.set_json(keys.rv_key(SPY), rv_payload(rv_20d=0.13))
+    payload = rig.engine.on_timer(event_ts_ns=NOW_NS, wall_ns=NOW_NS, today=TODAY)
+
+    assert payload["action"] == "LIVE_PAPER_ORDER_ROUTED"
+    assert payload["entry_block_reason"] is None
+    assert payload["rv_20d"] == 0.13
+    assert payload["candidates_scanned"] > 0
 
 OPEN_TRADE = {"combo": "SPY 690/685P Bull Put", "legs": LEGS, "expiry": "2026-12-18", "open_lots": 4.0, "entry_credit": 0.6}
 
