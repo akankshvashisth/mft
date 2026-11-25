@@ -180,3 +180,88 @@ class EventCalendar:
             reasons=reasons,
             macro_event_within_2d=f"{macro.date.isoformat()} {macro.name}" if macro is not None else None,
         )
+# ── CorporateEventProvider protocol and implementations ─────────────────────────────────────
+
+
+class CorporateEventProvider:
+    """Protocol for fetching corporate event data by symbol.
+
+    Implementations provide earnings dates, ex-dividend info and HTB borrow rates.
+    """
+
+    def earnings_dates(self, symbol: str) -> tuple[date, ...]:
+        raise NotImplementedError
+
+    def ex_dividends(self, symbol: str) -> tuple[DividendEvent, ...]:
+        raise NotImplementedError
+
+    def htb_borrow_rate(self, symbol: str) -> float:
+        """Annualized HTB borrow fee (0.0 = no HTB program, >0 = borrow cost as fraction)."""
+        return 0.0
+
+
+class YamlEventProvider(CorporateEventProvider):
+    """Reads corporate events from the repository's ``events.yaml`` file (via ``EventCalendar``)."""
+
+    def __init__(self, calendar: EventCalendar | None = None, path: str | None = None) -> None:
+        self._calendar = calendar if calendar is not None else EventCalendar(path=path)
+
+    def earnings_dates(self, symbol: str) -> tuple[date, ...]:
+        ev = self._calendar.events_for(symbol)
+        return ev.earnings if ev is not None else ()
+
+    def ex_dividends(self, symbol: str) -> tuple[DividendEvent, ...]:
+        ev = self._calendar.events_for(symbol)
+        return ev.ex_dividends if ev is not None else ()
+
+    def htb_borrow_rate(self, symbol: str) -> float:
+        ev = self._calendar.events_for(symbol)
+        return ev.htb_fee_annual if ev is not None else 0.0
+
+
+class CachedEventProvider(CorporateEventProvider):
+    """JSON/dict-backed event provider, ready for ThetaData/IBKR ingestion.
+
+    Unlike ``YamlEventProvider``, this loads events from a pre-built dict cache
+    (no YAML dependency).  Merge new data via ``update_symbol()``.
+    """
+
+    def __init__(self, data: dict[str, dict[str, Any]] | None = None) -> None:
+        self._data: dict[str, dict[str, Any]] = dict(data or {})
+
+    def earnings_dates(self, symbol: str) -> tuple[date, ...]:
+        entry = self._data.get(symbol, {})
+        raw = entry.get("earnings", ())
+        return tuple(as_date(d) for d in raw)
+
+    def ex_dividends(self, symbol: str) -> tuple[DividendEvent, ...]:
+        entry = self._data.get(symbol, {})
+        raw = entry.get("ex_dividends", ())
+        return tuple(
+            DividendEvent(date=as_date(d["date"]), amount=float(d["amount"]))
+            for d in raw if isinstance(d, dict) and "date" in d
+        )
+
+    def htb_borrow_rate(self, symbol: str) -> float:
+        entry = self._data.get(symbol, {})
+        return float(entry.get("htb_fee_annual", 0.0) or 0.0)
+
+    def update_symbol(self, symbol: str, data: dict[str, Any]) -> None:
+        """Merge new data for ``symbol`` (e.g. from a ThetaData webhook or IBKR snapshot)."""
+        self._data[symbol] = data
+
+
+def htb_blocks_entry(
+    provider: CorporateEventProvider,
+    symbol: str,
+    has_short_call: bool,
+    max_htb_rate: float = 0.15,
+) -> bool:
+    """Returns ``True`` when the symbol's HTB borrow rate exceeds ``max_htb_rate``.
+
+    A short call whose borrow cost would eat the strategy edge is blocked.
+    """
+    if not has_short_call:
+        return False
+    rate = provider.htb_borrow_rate(symbol)
+    return rate > max_htb_rate

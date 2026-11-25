@@ -153,3 +153,64 @@ def test_default_gate_calendar_is_the_file_backed_calendar():
     from src.risk.calendar import default_event_calendar
 
     assert isinstance(default_event_calendar(), EventCalendar)
+def test_yaml_event_provider_earnings(calendar):
+    pytest.importorskip("yaml")
+    from src.data.event_calendar import YamlEventProvider
+
+    provider = YamlEventProvider(calendar)
+    assert "2026-12-01" in [d.isoformat() for d in provider.earnings_dates("XBI.ARCA")]
+
+
+def test_cached_event_provider_earnings_and_dividends():
+    from src.data.event_calendar import CachedEventProvider
+
+    data = {
+        "SPY.ARCA": {
+            "earnings": [],
+            "ex_dividends": [{"date": "2026-12-18", "amount": 1.78}],
+            "htb_fee_annual": 0.08,
+        },
+        "XBI.ARCA": {
+            "earnings": ["2026-12-01", "2027-01-15"],
+            "ex_dividends": [],
+            "htb_fee_annual": 0.0,
+        },
+    }
+    provider = CachedEventProvider(data)
+    assert provider.earnings_dates("XBI.ARCA") == (date(2026, 12, 1), date(2027, 1, 15))
+    divs = provider.ex_dividends("SPY.ARCA")
+    assert len(divs) == 1 and divs[0].amount == 1.78
+    assert provider.earnings_dates("UNKNOWN") == ()
+
+
+def test_cached_provider_htb_rate():
+    from src.data.event_calendar import CachedEventProvider
+
+    provider = CachedEventProvider({
+        "HTB.ARCA": {"htb_fee_annual": 0.25, "earnings": [], "ex_dividends": []},
+    })
+    assert provider.htb_borrow_rate("HTB.ARCA") == 0.25
+    assert provider.htb_borrow_rate("NONE.ARCA") == 0.0
+
+
+def test_htb_blocks_short_call_above_threshold():
+    from src.data.event_calendar import (
+        CachedEventProvider,
+        htb_blocks_entry,
+    )
+
+    provider = CachedEventProvider({
+        "HTB.ARCA": {"htb_fee_annual": 0.20, "earnings": [], "ex_dividends": []},
+        "CHEAP.ARCA": {"htb_fee_annual": 0.08, "earnings": [], "ex_dividends": []},
+    })
+    assert htb_blocks_entry(provider, "HTB.ARCA", has_short_call=True, max_htb_rate=0.15)
+    assert not htb_blocks_entry(provider, "CHEAP.ARCA", has_short_call=True, max_htb_rate=0.15)
+    assert not htb_blocks_entry(provider, "HTB.ARCA", has_short_call=False, max_htb_rate=0.15)
+
+
+def test_cached_provider_update_symbol_merges():
+    from src.data.event_calendar import CachedEventProvider
+
+    provider = CachedEventProvider()
+    provider.update_symbol("NEW.ARCA", {"earnings": ["2026-12-15"], "ex_dividends": [], "htb_fee_annual": 0.0})
+    assert provider.earnings_dates("NEW.ARCA") == (date(2026, 12, 15),)
